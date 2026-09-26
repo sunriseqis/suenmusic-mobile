@@ -19,6 +19,7 @@
 |---|---|
 | [`architecture/ios-plan.md`](architecture/ios-plan.md) | iOS 端实施方案：原生播放桥（AVQueuePlayer）、回环代理式离线缓存、按平台分流的更新通道、免费签名路线、构建脚本，以及**改代码前必读的硬约束** |
 | [`guides/ios-自签安装指南.md`](guides/ios-自签安装指南.md) | 不付费自用的 iOS 安装与 7 天续签全流程（SideStore），含排错与命令速查 |
+| [`memory/README.md`](memory/README.md) | **移动端开发记忆**：长期不动摇的约束（`MEMORY.md`）＋ 按天的移动端摘录 |
 
 ## 构建
 
