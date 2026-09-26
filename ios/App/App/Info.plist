@@ -1,0 +1,107 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CAPACITOR_DEBUG</key>
+	<string>$(CAPACITOR_DEBUG)</string>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+        <string>SuenMusic</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(MARKETING_VERSION)</string>
+	<key>CFBundleVersion</key>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<!-- 后台音频：熄屏/切后台继续播放（对齐 Android 前台服务保活） -->
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>audio</string>
+	</array>
+	<!--
+	  本地网络权限（iOS 14 起）：服务端是局域网地址（192.168.x.x / Tailscale），
+	  访问本地网络必须由**用户**明确授权。
+
+	  ⚠️ 这个 key 是必需的：没有它系统**不会弹询问框，而是直接拒绝** ——
+	  日志里的表现是 `unsatisfied (Local network prohibited)` + `NSURLErrorDomain -1009`，
+	  明明连着 Wi-Fi（LQM: good）却连不上服务端，音频缓存一个字都下不下来
+	  （已落盘 0/0 字节），点播放就卡住。
+
+	  覆盖范围：原生 URLSession 与 WebView 里的 fetch 都算本 App 的网络访问，
+	  所以这一处声明同时解决「Web 端调 API」和「原生取流」两条路。
+	-->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>需要访问局域网内的 SuenMusic 服务器，用于播放音乐、加载封面与下载更新包。</string>
+	<!--
+	  ATS 例外：服务端是明文 http（局域网/Tailscale 直连），iOS 默认全拦。
+	  与 Android 端 androidScheme http 解决的是同一个坑（明文 API 服务器）。
+	-->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+	</dict>
+	<!--
+	  应用更新要唤起重签工具：canOpenURL 必须先在这里登记 scheme，否则
+	  即使工具已安装也永远返回 false（会被静默降级成"用 Safari 打开"）。
+	-->
+	<key>LSApplicationQueriesSchemes</key>
+	<array>
+		<string>altstore</string>
+		<string>sidestore</string>
+	</array>
+	<key>UIApplicationSceneManifest</key>
+	<dict>
+		<key>UIApplicationSupportsMultipleScenes</key>
+    <false/>
+    <key>UISceneConfigurations</key>
+    <dict>
+      <key>UIWindowSceneSessionRoleApplication</key>
+      <array>
+        <dict>
+            <key>UISceneConfigurationName</key>
+            <string>Default Configuration</string>
+            <key>UISceneDelegateClassName</key>
+            <string>$(PRODUCT_MODULE_NAME).SceneDelegate</string>
+            <key>UISceneStoryboardFile</key>
+            <string>Main</string>
+        </dict>
+      </array>
+    </dict>
+	</dict>
+	<key>UILaunchStoryboardName</key>
+	<string>LaunchScreen</string>
+	<key>UIMainStoryboardFile</key>
+	<string>Main</string>
+	<key>UIRequiredDeviceCapabilities</key>
+	<array>
+		<string>arm64</string>
+	</array>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+	<key>UISupportedInterfaceOrientations~ipad</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationPortraitUpsideDown</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+	<key>UIViewControllerBasedStatusBarAppearance</key>
+	<true/>
+</dict>
+</plist>

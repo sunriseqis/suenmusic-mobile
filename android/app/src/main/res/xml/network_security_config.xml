@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  明文 HTTP 白名单（v1 第 2 项）。
+
+  自用场景的现实：服务器地址可能是局域网 IP（http://192.168.x.x:3210）、
+  Tailscale 的 100.x/域名（http）——这些都没有证书，安卓 9+ 默认全拦。
+  因此 base 放行明文；走公网 https 域名（Lucky 反代）时不受影响，
+  系统仍按正常 TLS 校验。若未来要上架，这里需要收紧为域名白名单。
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

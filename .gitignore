@@ -1,0 +1,21 @@
+# 统一产物目录：只保留占位文件，APK / IPA 不入库
+app/*
+!app/.gitkeep
+
+# 构建中间产物
+app/build/
+app/build-unsigned/
+app/**/Payload/
+
+.DS_Store
+*.log
+
+# ⚠️ 这里**故意不写** `*.keystore`。
+# android/app/suenmusic.keystore 就是安卓发布签名，必须随仓库走
+# （CI 靠它签名，gradle 里的回退口令是 suenmusic/suenmusic）。
+# android/.gitignore 是 Android Studio 模板，其中的 *.keystore 两行本身就是注释掉的，
+# 所以 keystore 能被正常跟踪 —— 别去把那两行放开。
+#
+# 安卓与 iOS 各自的构建产物由它们目录内的 .gitignore 覆盖：
+#   android/.gitignore   ← Android Studio 模板
+#   ios/.gitignore       ← Xcode 产物 + cap sync 生成物

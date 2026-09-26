@@ -1,0 +1,174 @@
+name: Build Android APK
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - 'android/**'
+      - 'VERSION'
+      - '.github/workflows/build-android.yml'
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      custom_version:
+        description: '自定义版本号（可选，例如 1.1，留空则默认按 VERSION 文件）'
+        required: false
+        type: string
+        default: ''
+      publish_release:
+        description: '是否发布到 GitHub Release'
+        required: true
+        type: boolean
+        default: true
+      release_notes:
+        description: '发布说明（可选）'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build-android:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout mobile 仓库
+        uses: actions/checkout@v4
+        with:
+          # versionCode 要数提交数，必须是完整历史
+          fetch-depth: 0
+          path: suenmusic-mobile
+
+      # ⚠️ 前端（web）在**私有**的 suenmusic-server 仓库里，且必须与 mobile 检出在**同一级目录**：
+      #    `suenmusic-server/web/capacitor.config.ts` 里写的是 `../../suenmusic-mobile/android`，
+      #    `cap sync` 正是靠这条相对路径找到安卓工程的。改这里的 path 就要一起改那边。
+      - name: Checkout suenmusic-server 仓库（提供 web）
+        uses: actions/checkout@v4
+        with:
+          repository: sunriseqis/suenmusic-server
+          token: ${{ secrets.SUENMUSIC_REPO_TOKEN }}
+          path: suenmusic-server
+
+      - name: Determine Version
+        id: get_version
+        run: |
+          # versionCode 基数 20000（不是原仓库的 10000）：
+          # 旧仓库 suenmusic 已发到 10115，而本仓库是全新 git 历史（提交数从 1 起），
+          # 沿用 10000 会低于装机版本 → Android 报 INSTALL_FAILED_VERSION_DOWNGRADE。
+          # 与 scripts/build-ios.mjs 的 readVersionCode 保持一致。
+          COMMIT_COUNT=$(git -C suenmusic-mobile rev-list --count HEAD)
+          VERSION_CODE=$((20000 + COMMIT_COUNT))
+          echo "VERSION_CODE=${VERSION_CODE}" >> $GITHUB_ENV
+          echo "version_code=${VERSION_CODE}" >> $GITHUB_OUTPUT
+
+          # 读取当前正式版本号（默认为 1.0）
+          BASE_VER="1.0"
+          if [ -f "suenmusic-mobile/VERSION" ]; then
+            BASE_VER=$(cat suenmusic-mobile/VERSION | tr -d ' \n\r')
+          fi
+
+          # 计算 versionName 与 Release 标题（全部为正式版）
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            TAG_NAME="${GITHUB_REF#refs/tags/}"
+            RAW_VERSION="${TAG_NAME#v}"
+            VERSION="${TAG_NAME}"
+            VERSION_NAME="${RAW_VERSION}"
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ inputs.custom_version }}" ]]; then
+            INPUT_VER="${{ inputs.custom_version }}"
+            if [[ "$INPUT_VER" == v* ]]; then
+              VERSION="$INPUT_VER"
+              VERSION_NAME="${INPUT_VER#v}"
+            else
+              VERSION="v$INPUT_VER"
+              VERSION_NAME="$INPUT_VER"
+            fi
+          else
+            VERSION_NAME="${BASE_VER}"
+            VERSION="v${VERSION_NAME}"
+          fi
+
+          echo "VERSION=${VERSION}" >> $GITHUB_ENV
+          echo "VERSION_NAME=${VERSION_NAME}" >> $GITHUB_ENV
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "version_name=${VERSION_NAME}" >> $GITHUB_OUTPUT
+          echo "=== 正在构建 Android APK 正式版 ==="
+          echo "Version Name (显示版本): ${VERSION_NAME}"
+          echo "Version Code (内部自增): ${VERSION_CODE}"
+          echo "Release Tag  (发布标签): ${VERSION}"
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+          cache-dependency-path: 'suenmusic-server/web/package-lock.json'
+
+      - name: Setup Java 21 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Install Web Dependencies & Build Frontend
+        run: |
+          cd suenmusic-server/web
+          npm ci
+          npm run build
+          npx cap sync android
+
+      - name: Build Android Release APK
+        run: |
+          chmod +x suenmusic-mobile/android/gradlew
+          cd suenmusic-mobile/android
+          ./gradlew assembleRelease -PversionCode=${{ env.VERSION_CODE }} -PversionName="${{ env.VERSION_NAME }}" --stacktrace
+
+      # 产物统一归口到 mobile 仓库的 app/ 目录（与 iOS 的 IPA 同一处）
+      - name: Collect Artifact
+        run: |
+          mkdir -p suenmusic-mobile/app
+          APK=suenmusic-mobile/android/app/build/outputs/apk/release/app-release.apk
+          if [ ! -f "$APK" ]; then
+            echo "找不到 APK：$APK" >&2
+            exit 1
+          fi
+          cp "$APK" "suenmusic-mobile/app/SuenMusic-${VERSION}-release.apk"
+          ls -lh suenmusic-mobile/app/
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SuenMusic-${{ env.VERSION }}-apk
+          path: suenmusic-mobile/app/*.apk
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || (github.event_name == 'workflow_dispatch' && inputs.publish_release == true)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.VERSION }}
+          name: SuenMusic ${{ env.VERSION }} 移动端
+          prerelease: false
+          make_latest: true
+          generate_release_notes: false
+          body: |
+            ### SuenMusic ${{ env.VERSION }} 移动端发布 🎉
+
+            #### 📱 安装包（统一在 `app/` 目录）：
+            - `SuenMusic-${{ env.VERSION }}-release.apk`：安卓正式包，下载后可直接在手机上点击安装。
+            - `SuenMusic-${{ env.VERSION }}-release.ipa`：iOS 未签名包，由 AltStore / SideStore 等重签工具安装（见另一个 workflow 的产物）。
+
+            > 由 GitHub Actions 自动化流水线构建。服务端 / Web 见 [suenmusic-server](https://github.com/sunriseqis/suenmusic-server) 仓库。
+            ${{ inputs.release_notes && format('#### 📝 更新说明：\n{0}', inputs.release_notes) || '' }}
+          files: |
+            suenmusic-mobile/app/*.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,167 @@
+name: Build iOS IPA
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - 'ios/**'
+      - 'VERSION'
+      - 'scripts/**'
+      - '.github/workflows/build-ios.yml'
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      custom_version:
+        description: '自定义版本号（可选，例如 1.1，留空则默认按 VERSION 文件）'
+        required: false
+        type: string
+        default: ''
+      publish_release:
+        description: '是否发布到 GitHub Release'
+        required: true
+        type: boolean
+        default: true
+      release_notes:
+        description: '发布说明（可选）'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build-ios:
+    name: Build iOS IPA (unsigned)
+    # macOS runner 是唯一能跑 xcodebuild 的环境。产出**未签名** IPA，
+    # 因此不需要任何 Apple 证书 / 描述文件 / secrets —— 签名由
+    # AltStore / SideStore 重签时完成。
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout mobile 仓库
+        uses: actions/checkout@v4
+        with:
+          # versionCode 要数提交数，必须是完整历史
+          fetch-depth: 0
+          path: suenmusic-mobile
+
+      # ⚠️ 前端（web）在**私有**的 suenmusic-server 仓库里，且必须与 mobile 检出在**同一级目录**：
+      #    `suenmusic-mobile/scripts/build-ios.mjs` 里的 WEB_DIR 是 `../suenmusic-server/web`，
+      #    `suenmusic-server/web/capacitor.config.ts` 里的 ios.path 又是 `../../suenmusic-mobile/ios`。
+      #    这两条相对路径互为两面，改一个就要一起改。
+      - name: Checkout suenmusic-server 仓库（提供 web）
+        uses: actions/checkout@v4
+        with:
+          repository: sunriseqis/suenmusic-server
+          token: ${{ secrets.SUENMUSIC_REPO_TOKEN }}
+          path: suenmusic-server
+
+      - name: Determine Version
+        id: get_version
+        run: |
+          # 与 build-android.yml 完全相同的规则：基数 20000 + 本仓库提交数。
+          # （10000 是旧仓库 suenmusic 的基数，它已发到 10115。）
+          COMMIT_COUNT=$(git -C suenmusic-mobile rev-list --count HEAD)
+          VERSION_CODE=$((20000 + COMMIT_COUNT))
+          echo "VERSION_CODE=${VERSION_CODE}" >> $GITHUB_ENV
+          echo "version_code=${VERSION_CODE}" >> $GITHUB_OUTPUT
+
+          BASE_VER="1.0"
+          if [ -f "suenmusic-mobile/VERSION" ]; then
+            BASE_VER=$(cat suenmusic-mobile/VERSION | tr -d ' \n\r')
+          fi
+
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            TAG_NAME="${GITHUB_REF#refs/tags/}"
+            RAW_VERSION="${TAG_NAME#v}"
+            VERSION="${TAG_NAME}"
+            VERSION_NAME="${RAW_VERSION}"
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ inputs.custom_version }}" ]]; then
+            INPUT_VER="${{ inputs.custom_version }}"
+            if [[ "$INPUT_VER" == v* ]]; then
+              VERSION="$INPUT_VER"
+              VERSION_NAME="${INPUT_VER#v}"
+            else
+              VERSION="v$INPUT_VER"
+              VERSION_NAME="$INPUT_VER"
+            fi
+          else
+            VERSION_NAME="${BASE_VER}"
+            VERSION="v${VERSION_NAME}"
+          fi
+
+          echo "VERSION=${VERSION}" >> $GITHUB_ENV
+          echo "VERSION_NAME=${VERSION_NAME}" >> $GITHUB_ENV
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "=== 正在构建 iOS 未签名 IPA ==="
+          echo "Version Name: ${VERSION_NAME}"
+          echo "Release Tag : ${VERSION}"
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+          cache-dependency-path: 'suenmusic-server/web/package-lock.json'
+
+      - name: Install Web Dependencies
+        run: |
+          cd suenmusic-server/web
+          npm ci
+
+      # 脚本内部完成：web 构建 → cap sync ios → 还原本地 vendor 依赖 → xcodebuild → 打包 IPA。
+      # vendor 的 *.xcframework 不随仓库分发（被 .gitignore 排除），
+      # 脚本第 3 步的 fix-ios-vendor.sh 会从 GitHub Releases 下载（runner 直连没问题）。
+      - name: Build Unsigned IPA
+        run: |
+          cd suenmusic-mobile
+          npm run ios:ipa:unsigned
+
+      # 产物统一归口到 app/（与安卓的 APK 同一处）。
+      # 脚本把未签名包放在 app/unsigned/ 下（签名/未签名靠目录区分，文件名必须保持
+      # `SuenMusic-v<版本>-release.ipa` —— 服务端就是按这条正则挑包的）。
+      - name: Collect Artifact
+        run: |
+          mkdir -p suenmusic-mobile/app
+          SRC="suenmusic-mobile/app/unsigned/SuenMusic-${VERSION}-release.ipa"
+          if [ ! -f "$SRC" ]; then
+            echo "找不到 IPA：$SRC" >&2
+            ls -R suenmusic-mobile/app >&2 || true
+            exit 1
+          fi
+          cp "$SRC" "suenmusic-mobile/app/SuenMusic-${VERSION}-release.ipa"
+          ls -lh suenmusic-mobile/app/
+
+      - name: Upload IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SuenMusic-${{ env.VERSION }}-ipa
+          path: suenmusic-mobile/app/*.ipa
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || (github.event_name == 'workflow_dispatch' && inputs.publish_release == true)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.VERSION }}
+          name: SuenMusic ${{ env.VERSION }} 移动端
+          prerelease: false
+          make_latest: true
+          generate_release_notes: false
+          body: |
+            ### SuenMusic ${{ env.VERSION }} 移动端发布 🎉
+
+            #### 📱 安装包（统一在 `app/` 目录）：
+            - `SuenMusic-${{ env.VERSION }}-release.ipa`：**iOS 未签名包**，用 AltStore / SideStore 等重签工具安装（免费签名 7 天需续签）。
+            - `SuenMusic-${{ env.VERSION }}-release.apk`：安卓正式包，见另一个 workflow 的产物。
+
+            > 由 GitHub Actions 自动化流水线构建。服务端 / Web 见 [suenmusic-server](https://github.com/sunriseqis/suenmusic-server) 仓库。
+            ${{ inputs.release_notes && format('#### 📝 更新说明：\n{0}', inputs.release_notes) || '' }}
+          files: |
+            suenmusic-mobile/app/*.ipa
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
