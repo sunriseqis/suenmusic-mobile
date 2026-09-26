@@ -134,6 +134,24 @@ jobs:
             exit 1
           fi
           cp "$SRC" "suenmusic-mobile/app/SuenMusic-${VERSION}-release.ipa"
+
+          # —— 出厂自证 ——
+          # 重签工具对归档结构很挑，出问题只会报一句 "archive appears to be corrupt"，
+          # 而且往往下到手机上才发现。所以在这里先验三条：
+          #   1. zip 完整性
+          #   2. 顶层必须有 Payload/App.app/<可执行文件>
+          #   3. 不能混进 macOS 的 __MACOSX 元数据条目
+          # （2026-09-26 加：一次真实的 corrupt 误报来自「误用了 Actions Artifact」，
+          #   而 Artifact 一定是被 GitHub 再打一层 zip 的，不能直接当 IPA 用。）
+          IPA="suenmusic-mobile/app/SuenMusic-${VERSION}-release.ipa"
+          unzip -t "$IPA" > /dev/null || { echo "✖ IPA 完整性校验失败"; exit 1; }
+          unzip -l "$IPA" | grep -q 'Payload/App.app/App' || {
+            echo "✖ IPA 里找不到 Payload/App.app/App"; unzip -l "$IPA" | head -5; exit 1;
+          }
+          if unzip -l "$IPA" | grep -q '__MACOSX'; then
+            echo "✖ IPA 里混入了 __MACOSX 条目"; exit 1;
+          fi
+          echo "✔ IPA 结构校验通过（$(unzip -l "$IPA" | tail -1 | awk '{print $2}') 个条目）"
           ls -lh suenmusic-mobile/app/
 
       - name: Upload IPA Artifact
@@ -159,6 +177,10 @@ jobs:
             - `SuenMusic-${{ env.VERSION }}-release.ipa`：**iOS 未签名包**，用 AltStore / SideStore 等重签工具安装（免费签名 7 天需续签）。
             - `SuenMusic-${{ env.VERSION }}-release.apk`：安卓正式包，见另一个 workflow 的产物。
 
+            > ⚠️ **请从本 Release 下载附件安装**。Actions 页面里的 Artifact 是 GitHub 额外套的一层
+            > zip（下载得到 `SuenMusic-…-ipa.zip`），直接改后缀丢给重签工具会报
+            > `archive appears to be corrupt`。
+            >
             > 由 GitHub Actions 自动化流水线构建。服务端 / Web 见 [suenmusic-server](https://github.com/sunriseqis/suenmusic-server) 仓库。
             ${{ inputs.release_notes && format('#### 📝 更新说明：\n{0}', inputs.release_notes) || '' }}
           files: |

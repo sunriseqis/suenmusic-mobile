@@ -166,6 +166,9 @@ jobs:
             - `SuenMusic-${{ env.VERSION }}-release.apk`：安卓正式包，下载后可直接在手机上点击安装。
             - `SuenMusic-${{ env.VERSION }}-release.ipa`：iOS 未签名包，由 AltStore / SideStore 等重签工具安装（见另一个 workflow 的产物）。
 
+            > ⚠️ **请从本 Release 下载附件安装**。Actions 页面里的 Artifact 是 GitHub 额外套的一层
+            > zip，直接改后缀丢给安装工具会失败（iOS 侧尤其会报 `archive appears to be corrupt`）。
+            >
             > 由 GitHub Actions 自动化流水线构建。服务端 / Web 见 [suenmusic-server](https://github.com/sunriseqis/suenmusic-server) 仓库。
             ${{ inputs.release_notes && format('#### 📝 更新说明：\n{0}', inputs.release_notes) || '' }}
           files: |
