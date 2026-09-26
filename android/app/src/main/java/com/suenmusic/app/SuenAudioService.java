@@ -5,10 +5,14 @@ import android.content.Intent;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.util.Log;
 import androidx.annotation.OptIn;
 import androidx.media3.common.C;
+import androidx.media3.common.ForwardingPlayer;
 import androidx.media3.common.MediaItem;
 import androidx.media3.common.MediaMetadata;
+import androidx.media3.common.PlaybackException;
+import androidx.media3.common.Player;
 import androidx.media3.common.util.UnstableApi;
 import androidx.media3.exoplayer.ExoPlayer;
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory;
@@ -38,12 +42,16 @@ import java.util.Map;
  */
 public class SuenAudioService extends MediaSessionService {
 
+  private static final String TAG = "SuenAudioService";
   private static SuenAudioService activeService;
   private static final long LYRIC_TICK_MS = 200;
+  private static final int MAX_CONSECUTIVE_ERRORS = 5;
 
   private MediaSession session;
   private ExoPlayer player;
   private final Handler lyricHandler = new Handler(Looper.getMainLooper());
+  private final Handler autoSkipHandler = new Handler(Looper.getMainLooper());
+  private int consecutiveErrorCount = 0;
   private final Map<String, LyricTimeline> lyricTimelines = new HashMap<>();
   private final Map<String, Long> lyricRevisions = new HashMap<>();
   private final Map<String, String> originalArtists = new HashMap<>();
@@ -57,6 +65,50 @@ public class SuenAudioService extends MediaSessionService {
       if (player.isPlaying()) lyricHandler.postDelayed(this, LYRIC_TICK_MS);
     }
   };
+
+  private void cancelPendingAutoSkip() {
+    autoSkipHandler.removeCallbacksAndMessages(null);
+  }
+
+  /**
+   * 锁屏/后台错误自愈：当发生播放错误时自动跳下一首，避免 ExoPlayer 跌入 STATE_IDLE 彻底停播休克。
+   */
+  private void handlePlaybackFailure() {
+    if (player == null) return;
+    consecutiveErrorCount++;
+    if (consecutiveErrorCount >= MAX_CONSECUTIVE_ERRORS) {
+      Log.w(TAG, "连续播放失败已达 " + MAX_CONSECUTIVE_ERRORS + " 次，停止自动跳曲以防死循环");
+      consecutiveErrorCount = 0;
+      return;
+    }
+
+    final int count = player.getMediaItemCount();
+    if (count <= 1) {
+      Log.w(TAG, "播放队列仅 1 首或为空，无法自动跳下一首");
+      return;
+    }
+
+    final int currentIndex = player.getCurrentMediaItemIndex();
+    final int nextIndex;
+    if (player.getRepeatMode() == Player.REPEAT_MODE_ALL) {
+      nextIndex = (currentIndex + 1) % count;
+    } else if (currentIndex + 1 < count) {
+      nextIndex = currentIndex + 1;
+    } else {
+      Log.w(TAG, "已达列表末尾，无法跳下一首");
+      return;
+    }
+
+    Log.i(TAG, "单曲加载失败，自动跳至下一首: " + nextIndex + " / " + count);
+    cancelPendingAutoSkip();
+    autoSkipHandler.postDelayed(() -> {
+      if (player != null) {
+        player.seekToDefaultPosition(nextIndex);
+        player.prepare();
+        player.play();
+      }
+    }, 300);
+  }
 
   public static void submitLyricTimeline(
       String trackId, long revision, List<Long> starts, List<String> texts) {
@@ -73,7 +125,7 @@ public class SuenAudioService extends MediaSessionService {
         // 离线缓存（L1）：优先读本地缓存，未命中走上游并边播边存
         .setMediaSourceFactory(
             new DefaultMediaSourceFactory(SuenAudioCache.dataSourceFactory(this))
-                // 熄屏自愈：重试窗口拉长到覆盖上游冷却，见 SuenRetryPolicy
+                // 熄屏自愈：快速重试 transient 错误，超时快速抛出以触发自愈跳曲
                 .setLoadErrorHandlingPolicy(new SuenRetryPolicy())
         )
         .setAudioAttributes(SuenAudio.AUDIO_ATTRIBUTES, /* handleAudioFocus= */ true)
@@ -104,9 +156,25 @@ public class SuenAudioService extends MediaSessionService {
 
       @Override
       public void onIsPlayingChanged(boolean isPlaying) {
+        if (isPlaying) {
+          consecutiveErrorCount = 0;
+        }
         lyricHandler.removeCallbacks(lyricTicker);
         updateLyricMetadata();
         if (isPlaying) lyricHandler.post(lyricTicker);
+      }
+
+      @Override
+      public void onPlaybackStateChanged(int playbackState) {
+        if (playbackState == Player.STATE_READY) {
+          consecutiveErrorCount = 0;
+        }
+      }
+
+      @Override
+      public void onPlayerError(PlaybackException error) {
+        Log.e(TAG, "ExoPlayer 播放异常: " + error.getMessage(), error);
+        handlePlaybackFailure();
       }
     });
 
@@ -117,7 +185,92 @@ public class SuenAudioService extends MediaSessionService {
         intent,
         PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT
     );
-    session = new MediaSession.Builder(this, player)
+
+    // 包装 Player：拦截蓝牙/车机/线控在 STATE_IDLE 状态下的切歌与播放命令，强制自动 prepare() 唤醒播放器，
+    // 彻底解决蓝牙切歌在错误后无法起播、陷入永久死锁的问题。
+    Player wrappedPlayer = new ForwardingPlayer(player) {
+      @Override
+      public void seekToNextMediaItem() {
+        cancelPendingAutoSkip();
+        consecutiveErrorCount = 0;
+        boolean needPrepare = getPlaybackState() == Player.STATE_IDLE || getPlaybackState() == Player.STATE_ENDED;
+        super.seekToNextMediaItem();
+        if (needPrepare) {
+          prepare();
+          play();
+        }
+      }
+
+      @Override
+      public void seekToPreviousMediaItem() {
+        cancelPendingAutoSkip();
+        consecutiveErrorCount = 0;
+        boolean needPrepare = getPlaybackState() == Player.STATE_IDLE || getPlaybackState() == Player.STATE_ENDED;
+        super.seekToPreviousMediaItem();
+        if (needPrepare) {
+          prepare();
+          play();
+        }
+      }
+
+      @Override
+      public void seekToNext() {
+        cancelPendingAutoSkip();
+        consecutiveErrorCount = 0;
+        boolean needPrepare = getPlaybackState() == Player.STATE_IDLE || getPlaybackState() == Player.STATE_ENDED;
+        super.seekToNext();
+        if (needPrepare) {
+          prepare();
+          play();
+        }
+      }
+
+      @Override
+      public void seekToPrevious() {
+        cancelPendingAutoSkip();
+        consecutiveErrorCount = 0;
+        boolean needPrepare = getPlaybackState() == Player.STATE_IDLE || getPlaybackState() == Player.STATE_ENDED;
+        super.seekToPrevious();
+        if (needPrepare) {
+          prepare();
+          play();
+        }
+      }
+
+      @Override
+      public void seekToDefaultPosition(int mediaItemIndex) {
+        cancelPendingAutoSkip();
+        consecutiveErrorCount = 0;
+        boolean needPrepare = getPlaybackState() == Player.STATE_IDLE || getPlaybackState() == Player.STATE_ENDED;
+        super.seekToDefaultPosition(mediaItemIndex);
+        if (needPrepare) {
+          prepare();
+          play();
+        }
+      }
+
+      @Override
+      public void seekTo(int mediaItemIndex, long positionMs) {
+        cancelPendingAutoSkip();
+        consecutiveErrorCount = 0;
+        boolean needPrepare = getPlaybackState() == Player.STATE_IDLE || getPlaybackState() == Player.STATE_ENDED;
+        super.seekTo(mediaItemIndex, positionMs);
+        if (needPrepare) {
+          prepare();
+        }
+      }
+
+      @Override
+      public void play() {
+        cancelPendingAutoSkip();
+        if (getPlaybackState() == Player.STATE_IDLE || getPlaybackState() == Player.STATE_ENDED) {
+          prepare();
+        }
+        super.play();
+      }
+    };
+
+    session = new MediaSession.Builder(this, wrappedPlayer)
         .setSessionActivity(pendingIntent)
         .setCallback(callback)
         .build();
@@ -213,6 +366,10 @@ public class SuenAudioService extends MediaSessionService {
     extras.putString("suenmusic.lyric_text", text);
     extras.putBoolean("suenmusic.lyric_playing", player.isPlaying());
     String artist = text.isEmpty() ? original : text;
+    CharSequence currentArtist = current.mediaMetadata != null ? current.mediaMetadata.artist : null;
+    if (artist.equals(currentArtist != null ? currentArtist.toString() : "")) {
+      return;
+    }
     MediaMetadata metadata = current.mediaMetadata.buildUpon()
         .setArtist(artist)
         .setExtras(extras)
@@ -265,6 +422,7 @@ public class SuenAudioService extends MediaSessionService {
 
   @Override
   public void onDestroy() {
+    cancelPendingAutoSkip();
     lyricHandler.removeCallbacksAndMessages(null);
     lyricTimelines.clear();
     lyricRevisions.clear();
@@ -282,27 +440,14 @@ public class SuenAudioService extends MediaSessionService {
   }
 
   /**
-   * 熄屏自愈：把 ExoPlayer 的重试窗口拉长到覆盖上游风控冷却。
-   *
-   * ⚠️ 实测报障：后台播几首就停、解锁屏幕后才恢复。
-   * 根因是**唯一的自愈在 WebView 的 JS 里**（player store 的 handlePlaybackError），
-   * 而熄屏后安卓会挂起 WebView 的 JS（见上方 setPauseAtEndOfMediaItems 的注释）。
-   * 服务端在解析失败/冷却中回 503、上游取流失败回 502、中途断流直接断 socket 时，
-   * ExoPlayer 按默认策略只重试 3 次（累计约 25s）就放弃 —— 之后没有任何东西会再试，
-   * 于是停在那里等解锁。
-   *
-   * 这里把重试拉长到约 6 分钟，且**完全在原生层完成**（不依赖 WebView 是否在跑）。
-   * 每次重试都是重新请求同一个 `/api/stream/<id>?t=<token>`，服务端会重新解析音源，
-   * 所以冷却一过就能自动接上。
+   * 熄屏自愈重试策略：
+   * 快速重试 2 次（1s, 2s）覆盖瞬时弱网/颠簸抖动；超过后快速抛错触发原生 handlePlaybackFailure 自动跳下一首，
+   * 彻底避免长达数分钟的静音卡死。
    */
   @OptIn(markerClass = UnstableApi.class)
   private static final class SuenRetryPolicy extends DefaultLoadErrorHandlingPolicy {
-    /**
-     * 逐次重试的间隔（毫秒），累计约 6 分钟。
-     * 覆盖 qqCooldown（60s 起、上限 600s）与 biliCooldown 的窗口。
-     */
     private static final long[] RETRY_DELAYS_MS = {
-        2_000, 5_000, 10_000, 20_000, 30_000, 45_000, 60_000, 60_000, 60_000, 60_000
+        1_000, 2_000
     };
 
     @Override
@@ -316,7 +461,7 @@ public class SuenAudioService extends MediaSessionService {
       if (super.getRetryDelayMsFor(loadErrorInfo) == C.TIME_UNSET) return C.TIME_UNSET;
       // errorCount 从 1 开始计
       final int idx = loadErrorInfo.errorCount - 1;
-      if (idx < 0 || idx >= RETRY_DELAYS_MS.length) return C.TIME_UNSET; // 不再重试，交由 WebView
+      if (idx < 0 || idx >= RETRY_DELAYS_MS.length) return C.TIME_UNSET; // 不再重试，抛出由 onPlayerError 处理
       return RETRY_DELAYS_MS[idx];
     }
   }

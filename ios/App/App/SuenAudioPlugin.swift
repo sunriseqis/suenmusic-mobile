@@ -766,6 +766,9 @@ final class AudioEngine: NSObject {
     /// reason: 1=AUTO（repeat all 环绕接续） 2=SEEK
     private func rebuildQueue(from index: Int, positionMs: Int, autoplay: Bool, reason: Int) {
         guard tracks.indices.contains(index) else { return }
+        if reason == 2 {
+            consecutiveErrors = 0
+        }
         suppressTransitionEvent = true
 
         player.removeAllItems()
@@ -829,10 +832,38 @@ final class AudioEngine: NSObject {
         }
     }
 
+    private var consecutiveErrors = 0
+    private static let maxConsecutiveErrors = 5
+
+    private func handlePlaybackFailure() {
+        consecutiveErrors += 1
+        guard consecutiveErrors < Self.maxConsecutiveErrors else {
+            consecutiveErrors = 0
+            reportPlaying(false)
+            return
+        }
+        guard !tracks.isEmpty else { return }
+        let idx = currentIndex
+        if idx + 1 < tracks.count {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                guard let self = self else { return }
+                self.rebuildQueue(from: idx + 1, positionMs: 0, autoplay: true, reason: 1)
+            }
+        } else if repeatMode == .all {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                guard let self = self else { return }
+                self.rebuildQueue(from: 0, positionMs: 0, autoplay: true, reason: 1)
+            }
+        } else {
+            reportPlaying(false)
+        }
+    }
+
     @objc private func itemFailed(_ note: Notification) {
         let message = (note.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? NSError)?
             .localizedDescription ?? "播放错误"
         plugin?.emitError(message: message)
+        handlePlaybackFailure()
     }
 
     // MARK: 私有：播放状态上报
@@ -850,6 +881,9 @@ final class AudioEngine: NSObject {
         // 这里同时是**播放意图**的唯一写入点。放在去重之前：即使 Web 端已经知道
         // 这个状态（事件被去重吃掉），Now Playing 的 rate 也必须落在正确值上。
         playingIntent = playing
+        if playing {
+            consecutiveErrors = 0
+        }
 
         guard lastReportedPlaying != playing else { return }
         lastReportedPlaying = playing
@@ -886,6 +920,7 @@ final class AudioEngine: NSObject {
         reportedFailures.insert(key)
         if andStop { reportPlaying(false) }
         plugin?.emitError(message: item.error?.localizedDescription ?? "播放错误")
+        handlePlaybackFailure()
     }
 
     // MARK: 私有：状态跟踪
