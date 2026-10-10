@@ -3,16 +3,209 @@ import { bundleManager } from '@kit.AbilityKit';
 import { common } from '@kit.AbilityKit';
 import { Want } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
+import { avSession } from '@kit.AVSessionKit';
+import { http } from '@kit.NetworkKit';
+import { image } from '@kit.ImageKit';
 
 const TAG = 'SuenMusic_IndexPage';
 const DOMAIN = 0x0000;
 const LOCAL_ORIGIN = 'http://localhost';
 
+class HarmonyAVSessionManager {
+  private session: avSession.AVSession | null = null;
+  private context: common.UIAbilityContext;
+  private webviewController: webview.WebviewController;
+  private currentPixelMap: image.PixelMap | null = null;
+  private currentCoverUrl: string = '';
+
+  constructor(context: common.UIAbilityContext, webviewController: webview.WebviewController) {
+    this.context = context;
+    this.webviewController = webviewController;
+  }
+
+  async init(): Promise<void> {
+    try {
+      this.session = await avSession.createAVSession(this.context, 'SuenMusicSession', 'audio');
+      await this.session.activate();
+      hilog.info(DOMAIN, TAG, 'AVSession created and activated successfully');
+      this.registerSessionListeners();
+    } catch (err) {
+      hilog.error(DOMAIN, TAG, 'Failed to create AVSession: %{public}s', JSON.stringify(err));
+    }
+  }
+
+  private registerSessionListeners(): void {
+    if (!this.session) return;
+
+    this.session.on('play', () => {
+      hilog.info(DOMAIN, TAG, 'AVSession received: play');
+      this.dispatchWebControl('play');
+    });
+
+    this.session.on('pause', () => {
+      hilog.info(DOMAIN, TAG, 'AVSession received: pause');
+      this.dispatchWebControl('pause');
+    });
+
+    this.session.on('playNext', () => {
+      hilog.info(DOMAIN, TAG, 'AVSession received: playNext');
+      this.dispatchWebControl('next');
+    });
+
+    this.session.on('playPrevious', () => {
+      hilog.info(DOMAIN, TAG, 'AVSession received: playPrevious');
+      this.dispatchWebControl('prev');
+    });
+
+    this.session.on('seek', (timeMs: number) => {
+      hilog.info(DOMAIN, TAG, 'AVSession received: seek %{public}d', timeMs);
+      this.dispatchWebControl('seek', timeMs);
+    });
+  }
+
+  private dispatchWebControl(action: string, param?: number): void {
+    try {
+      let script = '';
+      if (action === 'seek' && typeof param === 'number') {
+        script = `if (window.__suenAudioControl) { window.__suenAudioControl.seek(${param}); }`;
+      } else {
+        script = `if (window.__suenAudioControl) { window.__suenAudioControl.${action}(); }`;
+      }
+      this.webviewController.runJavaScript(script);
+    } catch (e) {
+      hilog.error(DOMAIN, TAG, 'Failed to run web control script: %{public}s', JSON.stringify(e));
+    }
+  }
+
+  async updateMetadata(meta: {
+    assetId?: string;
+    title?: string;
+    artist?: string;
+    album?: string;
+    coverUrl?: string;
+    durationMs?: number;
+  }): Promise<void> {
+    if (!this.session) return;
+
+    let pixelMap: image.PixelMap | undefined = undefined;
+    const cover = meta.coverUrl ? meta.coverUrl.trim() : '';
+
+    if (cover && (cover.startsWith('http://') || cover.startsWith('https://'))) {
+      if (cover === this.currentCoverUrl && this.currentPixelMap) {
+        pixelMap = this.currentPixelMap;
+      } else {
+        pixelMap = await this.downloadCoverPixelMap(cover);
+        if (pixelMap) {
+          if (this.currentPixelMap && this.currentPixelMap !== pixelMap) {
+            try {
+              await this.currentPixelMap.release();
+            } catch (e) {
+              // ignore
+            }
+          }
+          this.currentPixelMap = pixelMap;
+          this.currentCoverUrl = cover;
+        }
+      }
+    }
+
+    const metadata: avSession.AVMetadata = {
+      assetId: meta.assetId || 'suen_' + Date.now(),
+      title: meta.title || '未知曲目',
+      artist: meta.artist || '未知歌手',
+      album: meta.album || 'SuenMusic',
+      duration: meta.durationMs || 0,
+      mediaImage: pixelMap || this.currentPixelMap || undefined
+    };
+
+    try {
+      await this.session.setAVMetadata(metadata);
+      hilog.info(DOMAIN, TAG, 'setAVMetadata success: title=%{public}s, hasCover=%{public}s',
+        metadata.title || '', (pixelMap || this.currentPixelMap) ? 'true' : 'false');
+    } catch (err) {
+      hilog.error(DOMAIN, TAG, 'setAVMetadata failed: %{public}s', JSON.stringify(err));
+    }
+  }
+
+  async updatePlaybackState(stateStr: string, positionMs?: number, durationMs?: number): Promise<void> {
+    if (!this.session) return;
+
+    try {
+      let state = avSession.PlaybackState.PLAYBACK_STATE_PAUSE;
+      if (stateStr === 'playing') {
+        state = avSession.PlaybackState.PLAYBACK_STATE_PLAY;
+      } else if (stateStr === 'stopped' || stateStr === 'idle') {
+        state = avSession.PlaybackState.PLAYBACK_STATE_STOP;
+      }
+
+      const elapsed = Math.max(0, Math.round(positionMs || 0));
+      const playbackState: avSession.AVPlaybackState = {
+        state: state,
+        position: {
+          elapsedTime: elapsed,
+          updateTime: new Date().getTime()
+        },
+        duration: durationMs || 0
+      };
+
+      await this.session.setAVPlaybackState(playbackState);
+    } catch (err) {
+      hilog.error(DOMAIN, TAG, 'setAVPlaybackState failed: %{public}s', JSON.stringify(err));
+    }
+  }
+
+  private async downloadCoverPixelMap(url: string): Promise<image.PixelMap | undefined> {
+    try {
+      const httpRequest = http.createHttp();
+      const response = await httpRequest.request(url, {
+        method: http.RequestMethod.GET,
+        connectTimeout: 5000,
+        readTimeout: 5000,
+        header: {
+          'Referer': ''
+        }
+      });
+
+      if (response.responseCode === 200 && response.result instanceof ArrayBuffer) {
+        const imageSource = image.createImageSource(response.result);
+        const decodingOptions: image.DecodingOptions = {
+          desiredSize: { width: 512, height: 512 }
+        };
+        const pixelMap = await imageSource.createPixelMap(decodingOptions);
+        await imageSource.release();
+        httpRequest.destroy();
+        return pixelMap;
+      }
+      httpRequest.destroy();
+    } catch (err) {
+      hilog.error(DOMAIN, TAG, 'Failed to downloadCoverPixelMap from %{public}s: %{public}s', url, JSON.stringify(err));
+    }
+    return undefined;
+  }
+
+  async destroy(): Promise<void> {
+    if (!this.session) return;
+    try {
+      if (this.currentPixelMap) {
+        await this.currentPixelMap.release();
+        this.currentPixelMap = null;
+      }
+      await this.session.destroy();
+      this.session = null;
+      hilog.info(DOMAIN, TAG, 'AVSession destroyed');
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'Failed to destroy AVSession: %{public}s', JSON.stringify(e));
+    }
+  }
+}
+
 class HarmonyBridge {
   private context: common.UIAbilityContext;
+  private avSessionManager: HarmonyAVSessionManager;
 
-  constructor(context: common.UIAbilityContext) {
+  constructor(context: common.UIAbilityContext, avSessionManager: HarmonyAVSessionManager) {
     this.context = context;
+    this.avSessionManager = avSessionManager;
   }
 
   // 获取当前原生应用版本号
@@ -58,6 +251,35 @@ class HarmonyBridge {
   getPlatform(): string {
     return 'harmony_next';
   }
+
+  updateMediaMetadata(metaJson: string): void {
+    try {
+      const data: Record<string, string | number> = JSON.parse(metaJson);
+      this.avSessionManager.updateMetadata({
+        assetId: String(data.assetId || ''),
+        title: String(data.title || ''),
+        artist: String(data.artist || ''),
+        album: String(data.album || ''),
+        coverUrl: String(data.coverUrl || ''),
+        durationMs: Number(data.durationMs || 0)
+      });
+    } catch (err) {
+      hilog.error(DOMAIN, TAG, 'updateMediaMetadata parse failed: %{public}s', JSON.stringify(err));
+    }
+  }
+
+  updatePlaybackState(stateJson: string): void {
+    try {
+      const data: Record<string, string | number> = JSON.parse(stateJson);
+      this.avSessionManager.updatePlaybackState(
+        String(data.state || ''),
+        Number(data.positionMs || 0),
+        Number(data.durationMs || 0)
+      );
+    } catch (err) {
+      hilog.error(DOMAIN, TAG, 'updatePlaybackState parse failed: %{public}s', JSON.stringify(err));
+    }
+  }
 }
 
 @Entry
@@ -66,7 +288,14 @@ struct Index {
   private webviewController: webview.WebviewController = new webview.WebviewController();
   @StorageProp('topAvoidHeight') topAvoidHeight: number = 0;
   @StorageProp('bottomAvoidHeight') bottomAvoidHeight: number = 0;
-  private bridge: HarmonyBridge = new HarmonyBridge(getContext(this) as common.UIAbilityContext);
+  private avSessionManager: HarmonyAVSessionManager = new HarmonyAVSessionManager(
+    getContext(this) as common.UIAbilityContext,
+    this.webviewController
+  );
+  private bridge: HarmonyBridge = new HarmonyBridge(
+    getContext(this) as common.UIAbilityContext,
+    this.avSessionManager
+  );
 
   aboutToAppear(): void {
     try {
@@ -75,6 +304,11 @@ struct Index {
     } catch (err) {
       hilog.warn(DOMAIN, TAG, 'Failed to set web debugging: %{public}s', JSON.stringify(err));
     }
+    this.avSessionManager.init();
+  }
+
+  aboutToDisappear(): void {
+    this.avSessionManager.destroy();
   }
 
   // 拦截系统返回手势/返回键：优先让网页后退
@@ -141,7 +375,14 @@ struct Index {
         .javaScriptProxy({
           object: this.bridge,
           name: 'SuenHarmony',
-          methodList: ['getAppVersion', 'openInBrowser', 'isNativePlatform', 'getPlatform'],
+          methodList: [
+            'getAppVersion',
+            'openInBrowser',
+            'isNativePlatform',
+            'getPlatform',
+            'updateMediaMetadata',
+            'updatePlaybackState'
+          ],
           controller: this.webviewController
         })
         .onInterceptRequest((event) => {
