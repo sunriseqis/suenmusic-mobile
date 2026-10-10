@@ -43,7 +43,7 @@ jobs:
 
     steps:
       - name: Checkout mobile 仓库
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
         with:
           # versionCode 要数提交数，必须是完整历史
           fetch-depth: 0
@@ -54,7 +54,7 @@ jobs:
       #    `suenmusic-server/web/capacitor.config.ts` 里的 ios.path 又是 `../../suenmusic-mobile/ios`。
       #    这两条相对路径互为两面，改一个就要一起改。
       - name: Checkout suenmusic-server 仓库（提供 web）
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
         with:
           repository: sunriseqis/suenmusic-server
           token: ${{ secrets.SUENMUSIC_REPO_TOKEN }}
@@ -102,7 +102,7 @@ jobs:
           echo "Release Tag : ${VERSION}"
 
       - name: Setup Node.js 22
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: 'npm'
@@ -155,7 +155,7 @@ jobs:
           ls -lh suenmusic-mobile/app/
 
       - name: Upload IPA Artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v4
         with:
           name: SuenMusic-${{ env.VERSION }}-ipa
           path: suenmusic-mobile/app/*.ipa
@@ -163,7 +163,7 @@ jobs:
 
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || (github.event_name == 'workflow_dispatch' && inputs.publish_release == true)
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.VERSION }}
           name: SuenMusic ${{ env.VERSION }} 移动端

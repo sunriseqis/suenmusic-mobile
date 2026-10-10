@@ -1,5 +1,5 @@
 import { webview } from '@kit.ArkWeb';
-import { bundleManager, common, Want, wantAgent, WantAgent } from '@kit.AbilityKit';
+import { bundleManager, common, Want, wantAgent } from '@kit.AbilityKit';
 import { backgroundTaskManager } from '@kit.BackgroundTasksKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { avSession } from '@kit.AVSessionKit';
@@ -169,7 +169,7 @@ class HarmonyAVSessionManager {
     }
   }
 
-  private async getContinuousTaskWantAgent(): Promise<WantAgent> {
+  private async getContinuousTaskWantAgent(): Promise<wantAgent.WantAgent> {
     const bundleName = this.context.abilityInfo?.bundleName || 'com.suenmusic.app';
     const abilityName = this.context.abilityInfo?.name || 'EntryAbility';
     const wantAgentInfo: wantAgent.WantAgentInfo = {
@@ -241,7 +241,7 @@ class HarmonyAVSessionManager {
         // 若 30 秒内未恢复播放，则自动释放长时任务以满足系统能效审计要求。
         if (this.stopTaskTimer === -1) {
           this.stopTaskTimer = setTimeout(() => {
-            void this.stopContinuousTask();
+            this.stopContinuousTask();
             this.stopTaskTimer = -1;
           }, 30000);
         }
