@@ -10,6 +10,14 @@ const TAG = 'SuenMusic_IndexPage';
 const DOMAIN = 0x0000;
 const LOCAL_ORIGIN = 'http://localhost';
 
+/**
+ * web 侧送来的曲目信息。**两条消息共用同一个形状**：
+ *   - `SuenHarmony.updateMediaMetadata(metaJson)` —— 曲目变化时推元数据
+ *   - `SuenHarmony.updateLyric(payloadJson)`      —— 歌词消息，**也带完整元数据**
+ *
+ * 之所以让歌词消息也带元数据：两条路若只有一条能到（历史上就是这样），
+ * 控件就会整条缺失。带上之后，任何一条先到都能把播控中心建立起来。
+ */
 interface MusicMetadataParam {
   assetId?: string;
   title?: string;
@@ -24,11 +32,6 @@ interface PlaybackStateJsonData {
   state?: string;
   positionMs?: number;
   durationMs?: number;
-}
-
-interface LyricJsonData {
-  assetId?: string;
-  lyric?: string;
 }
 
 class HarmonyAVSessionManager {
@@ -132,6 +135,17 @@ class HarmonyAVSessionManager {
    *    谁最后 resolve 谁就赢。只有序号仍是最新值的结果才允许落地。
    */
   async updateMetadata(meta: MusicMetadataParam): Promise<void> {
+    try {
+      await this.doUpdateMetadata(meta);
+    } catch (err) {
+      // JS 桥是"发完不管"地调它（不 await），异常绝不能抛回桥 ——
+      // 未处理的 Promise 拒绝在鸿蒙上会被记成应用错误。
+      hilog.error(DOMAIN, TAG, 'updateMetadata 异常: %{public}s', JSON.stringify(err));
+    }
+  }
+
+  /** updateMetadata 的实现体。外面那层只负责兜异常 */
+  private async doUpdateMetadata(meta: MusicMetadataParam): Promise<void> {
     const session = this.session;
     if (!session) {
       // 以前这里是静默 return —— 元数据被丢弃却毫无痕迹，极难排查
@@ -212,13 +226,10 @@ class HarmonyAVSessionManager {
     const meta = this.currentMetadata;
     if (!session || !meta) return;
 
-    if (this.currentPixelMap && this.currentPixelMap !== pixelMap) {
-      try {
-        await this.currentPixelMap.release();
-      } catch (e) {
-        // ignore
-      }
-    }
+    // ⚠️ **不释放** this.currentPixelMap：它已经被交给系统播控中心当作
+    // mediaImage 了，释放正在被系统持有的 PixelMap 有让那条控件渲染失败的
+    // 风险。旧的那张交给 GC 回收即可（每张 512×512，代价可接受）。
+    // 上面"已切歌"分支里释放的是**从未交给过系统**的那张，所以那里是安全的。
     this.currentPixelMap = pixelMap;
     this.currentCoverUrl = cover;
     meta.mediaImage = pixelMap;
@@ -235,52 +246,64 @@ class HarmonyAVSessionManager {
    * 更新歌词（系统锁屏 / 播控中心显示用）。
    *
    * ⚠️ 这里曾经在 currentMetadata 为空时**凭空造一条 AVMetadata** 推给系统
-   * （assetId 写死 'suen_current'、title 写死 '未知曲目'）。而 web 侧在 App
-   * 启动、队列为空、切歌时都会先推一条空歌词 —— 于是播控中心一上来就变成
-   * 「未知曲目」，还要等真正的元数据来覆盖它（而那次未必到）。
+   * （assetId 写死 'suen_current'、title 写死 '未知曲目'），于是播控中心一上来
+   * 就是「未知曲目」。现在**只用 web 真实送来的数据，绝不编造标题**。
    *
-   * 现在只记 currentLyric，**绝不伪造标题**：元数据还没来就先存着，
-   * 等 updateMetadata 到达时一并推出去。
+   * ⚠️ 更要紧的一条：**不能依赖 updateMetadata 先到**。web 侧的歌词消息现在
+   * 带上了完整元数据，所以单靠这条消息也能把播控中心建立起来 ——
+   * 两条路互不依赖，任何一条先到都不会让控件缺失（这是上一版"控件完全消失"
+   * 的根因方向：当时歌词消息只在元数据已存在时才推，元数据那条要是没到，
+   * 控件就整条都没有了）。
    */
-  async updateLyric(assetId: string, lyricLrc: string): Promise<void> {
-    const session = this.session;
-    if (!session) {
-      hilog.error(DOMAIN, TAG, '歌词被丢弃：AVSession 尚未就绪');
-      return;
-    }
-
-    // 元数据还没到：先存着，不碰系统 UI
-    const meta = this.currentMetadata;
-    if (!meta) {
-      this.currentLyric = assetId ? lyricLrc : '';
-      hilog.info(DOMAIN, TAG, '歌词先于元数据到达，暂存 %{public}d 字（assetId=%{public}s）',
-        this.currentLyric.length, assetId || '(空)');
-      return;
-    }
-
-    // 歌词属于"当前这首"才收。assetId 为空 = web 那边暂时没有曲目，
-    // 只清歌词，绝不动标题与封面。
-    if (assetId && assetId !== this.currentAssetId) {
-      hilog.info(DOMAIN, TAG,
-        '歌词与当前曲目不符，忽略（歌词 assetId=%{public}s，当前 assetId=%{public}s）',
-        assetId, this.currentAssetId || '(空)');
-      return;
-    }
-    if (!assetId && lyricLrc) {
-      // 没有 assetId 却带着歌词：来源不可信，丢弃
-      hilog.info(DOMAIN, TAG, '歌词缺少 assetId，忽略');
-      return;
-    }
-
-    this.currentLyric = lyricLrc;
-    meta.lyric = lyricLrc || undefined;
-
+  async updateLyric(payload: MusicMetadataParam): Promise<void> {
     try {
+      const session = this.session;
+      if (!session) {
+        hilog.error(DOMAIN, TAG, '歌词被丢弃：AVSession 尚未就绪');
+        return;
+      }
+
+      const assetId = payload.assetId || '';
+
+      // 换曲（或首次）：用这条消息自带的元数据把整条状态重建起来。
+      // doUpdateMetadata 会推文本、把 lyric 一起带上、再异步补封面。
+      if (assetId && assetId !== this.currentAssetId) {
+        hilog.info(DOMAIN, TAG, '歌词消息带来新曲目，先重建元数据（assetId=%{public}s）', assetId);
+        await this.doUpdateMetadata(payload);
+        return;
+      }
+
+      const meta = this.currentMetadata;
+      if (!meta) {
+        // 还没有当前曲目的元数据：这条消息若自带元数据就用它建立，否则只暂存歌词
+        if (assetId && (payload.title || payload.artist)) {
+          hilog.info(DOMAIN, TAG, '歌词消息自带元数据，先建立播控中心（assetId=%{public}s）', assetId);
+          await this.doUpdateMetadata(payload);
+          return;
+        }
+        this.currentLyric = assetId ? payload.lyric || '' : '';
+        hilog.info(DOMAIN, TAG, '歌词先于元数据到达，暂存 %{public}d 字（assetId=%{public}s）',
+          this.currentLyric.length, assetId || '(空)');
+        return;
+      }
+
+      // 走到这里说明曲目相同（assetId 为空 = web 那边暂时没有曲目）：
+      // 只清/更新歌词，绝不动标题与封面。
+      if (!assetId && payload.lyric) {
+        hilog.info(DOMAIN, TAG, '歌词缺少 assetId，忽略');
+        return;
+      }
+
+      const lyric = payload.lyric || '';
+      this.currentLyric = lyric;
+      meta.lyric = lyric || undefined;
+
       await session.setAVMetadata(meta);
       hilog.info(DOMAIN, TAG, 'setAVMetadata(歌词) success: assetId=%{public}s, len=%{public}d',
-        this.currentAssetId || '(空)', lyricLrc ? lyricLrc.length : 0);
+        this.currentAssetId || '(空)', lyric.length);
     } catch (err) {
-      hilog.error(DOMAIN, TAG, 'setAVMetadata(歌词) failed: %{public}s', JSON.stringify(err));
+      // 同 updateMetadata：JS 桥不 await，异常绝不能抛回去
+      hilog.error(DOMAIN, TAG, 'updateLyric 异常: %{public}s', JSON.stringify(err));
     }
   }
 
@@ -513,18 +536,30 @@ class HarmonyBridge {
     return 'harmony_next';
   }
 
+  /**
+   * 元数据消息与歌词消息**形状相同**，解析逻辑共用。
+   * 歌词消息也带完整元数据 —— 这样任何一条先到都能把播控中心建立起来。
+   */
+  private parseMeta(json: string): MusicMetadataParam {
+    const data = JSON.parse(json) as MusicMetadataParam;
+    return {
+      assetId: String(data.assetId || ''),
+      title: String(data.title || ''),
+      artist: String(data.artist || ''),
+      album: String(data.album || ''),
+      coverUrl: String(data.coverUrl || ''),
+      durationMs: Number(data.durationMs || 0),
+      lyric: String(data.lyric || '')
+    };
+  }
+
   updateMediaMetadata(metaJson: string): void {
     try {
-      const data = JSON.parse(metaJson) as MusicMetadataParam;
-      const param: MusicMetadataParam = {
-        assetId: String(data.assetId || ''),
-        title: String(data.title || ''),
-        artist: String(data.artist || ''),
-        album: String(data.album || ''),
-        coverUrl: String(data.coverUrl || ''),
-        durationMs: Number(data.durationMs || 0)
-      };
-      this.avSessionManager.updateMetadata(param);
+      const meta = this.parseMeta(metaJson);
+      // 入口留痕：这条日志能直接回答"web 到底有没有调这个接口"
+      hilog.info(DOMAIN, TAG, '收到元数据上报: assetId=%{public}s, title=%{public}s, 有封面=%{public}s',
+        meta.assetId || '', meta.title || '', meta.coverUrl ? 'yes' : 'no');
+      this.avSessionManager.updateMetadata(meta);
     } catch (err) {
       hilog.error(DOMAIN, TAG, 'updateMediaMetadata parse failed: %{public}s', JSON.stringify(err));
     }
@@ -545,8 +580,10 @@ class HarmonyBridge {
 
   updateLyric(lyricJson: string): void {
     try {
-      const data = JSON.parse(lyricJson) as LyricJsonData;
-      this.avSessionManager.updateLyric(String(data.assetId || ''), String(data.lyric || ''));
+      const meta = this.parseMeta(lyricJson);
+      hilog.info(DOMAIN, TAG, '收到歌词上报: assetId=%{public}s, len=%{public}d, 带元数据=%{public}s',
+        meta.assetId || '', meta.lyric ? meta.lyric.length : 0, meta.title ? 'yes' : 'no');
+      this.avSessionManager.updateLyric(meta);
     } catch (err) {
       hilog.error(DOMAIN, TAG, 'updateLyric parse failed: %{public}s', JSON.stringify(err));
     }
