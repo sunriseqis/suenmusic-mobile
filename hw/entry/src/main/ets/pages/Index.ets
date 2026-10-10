@@ -10,6 +10,27 @@ const TAG = 'SuenMusic_IndexPage';
 const DOMAIN = 0x0000;
 const LOCAL_ORIGIN = 'http://localhost';
 
+interface MusicMetadataParam {
+  assetId?: string;
+  title?: string;
+  artist?: string;
+  album?: string;
+  coverUrl?: string;
+  durationMs?: number;
+  lyric?: string;
+}
+
+interface PlaybackStateJsonData {
+  state?: string;
+  positionMs?: number;
+  durationMs?: number;
+}
+
+interface LyricJsonData {
+  assetId?: string;
+  lyric?: string;
+}
+
 class HarmonyAVSessionManager {
   private session: avSession.AVSession | null = null;
   private context: common.UIAbilityContext;
@@ -84,15 +105,7 @@ class HarmonyAVSessionManager {
     }
   }
 
-  async updateMetadata(meta: {
-    assetId?: string;
-    title?: string;
-    artist?: string;
-    album?: string;
-    coverUrl?: string;
-    durationMs?: number;
-    lyric?: string;
-  }): Promise<void> {
+  async updateMetadata(meta: MusicMetadataParam): Promise<void> {
     if (!this.session) return;
 
     let pixelMap: image.PixelMap | undefined = undefined;
@@ -147,11 +160,12 @@ class HarmonyAVSessionManager {
     if (!this.session) return;
 
     if (!this.currentMetadata) {
-      this.currentMetadata = {
+      const initMeta: avSession.AVMetadata = {
         assetId: assetId || 'suen_current',
         title: '未知曲目',
         lyric: lyricLrc
       };
+      this.currentMetadata = initMeta;
     } else {
       if (!assetId || this.currentMetadata.assetId === assetId || this.currentMetadata.assetId.startsWith('suen_')) {
         this.currentMetadata.lyric = lyricLrc;
@@ -169,16 +183,27 @@ class HarmonyAVSessionManager {
     }
   }
 
-  private async getContinuousTaskWantAgent(): Promise<wantAgent.WantAgent> {
+  /**
+   * 连续任务（AUDIO_PLAYBACK 长时任务）需要的 WantAgent。
+   *
+   * ⚠️ 这里**故意不写返回类型**，两个"显然"的写法都是错的：
+   *   - `Promise<wantAgent.WantAgent>`：`@kit.AbilityKit` 的 wantAgent 命名空间
+   *     **没有导出 `WantAgent` 这个名字**（只有 `getWantAgent`），
+   *     报 10505001 'wantAgent' has no exported member named 'WantAgent'。
+   *   - `Promise<Object>`：`backgroundTaskManager.startBackgroundRunning()`
+   *     的第三个参数正是那个未导出的类型，`Object` 是它的父类型、传不进去，
+   *     只会把"名字找不到"换成一个新的"类型不匹配"。
+   * 交给类型推断：`getWantAgent()` 的返回类型恰好就是 API 期望的那个类型。
+   */
+  private async getContinuousTaskWantAgent() {
     const bundleName = this.context.abilityInfo?.bundleName || 'com.suenmusic.app';
     const abilityName = this.context.abilityInfo?.name || 'EntryAbility';
+    const targetWant: Want = {
+      bundleName: bundleName,
+      abilityName: abilityName
+    };
     const wantAgentInfo: wantAgent.WantAgentInfo = {
-      wants: [
-        {
-          bundleName: bundleName,
-          abilityName: abilityName
-        }
-      ],
+      wants: [targetWant],
       actionType: wantAgent.OperationType.START_ABILITY,
       requestCode: 0,
       actionFlags: [wantAgent.WantAgentFlags.UPDATE_PRESENT_FLAG]
@@ -368,15 +393,16 @@ class HarmonyBridge {
 
   updateMediaMetadata(metaJson: string): void {
     try {
-      const data: Record<string, string | number> = JSON.parse(metaJson);
-      this.avSessionManager.updateMetadata({
+      const data = JSON.parse(metaJson) as MusicMetadataParam;
+      const param: MusicMetadataParam = {
         assetId: String(data.assetId || ''),
         title: String(data.title || ''),
         artist: String(data.artist || ''),
         album: String(data.album || ''),
         coverUrl: String(data.coverUrl || ''),
         durationMs: Number(data.durationMs || 0)
-      });
+      };
+      this.avSessionManager.updateMetadata(param);
     } catch (err) {
       hilog.error(DOMAIN, TAG, 'updateMediaMetadata parse failed: %{public}s', JSON.stringify(err));
     }
@@ -384,7 +410,7 @@ class HarmonyBridge {
 
   updatePlaybackState(stateJson: string): void {
     try {
-      const data: Record<string, string | number> = JSON.parse(stateJson);
+      const data = JSON.parse(stateJson) as PlaybackStateJsonData;
       this.avSessionManager.updatePlaybackState(
         String(data.state || ''),
         Number(data.positionMs || 0),
@@ -397,7 +423,7 @@ class HarmonyBridge {
 
   updateLyric(lyricJson: string): void {
     try {
-      const data: Record<string, string> = JSON.parse(lyricJson);
+      const data = JSON.parse(lyricJson) as LyricJsonData;
       this.avSessionManager.updateLyric(String(data.assetId || ''), String(data.lyric || ''));
     } catch (err) {
       hilog.error(DOMAIN, TAG, 'updateLyric parse failed: %{public}s', JSON.stringify(err));
