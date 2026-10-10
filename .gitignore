@@ -19,3 +19,14 @@ app/**/Payload/
 # 安卓与 iOS 各自的构建产物由它们目录内的 .gitignore 覆盖：
 #   android/.gitignore   ← Android Studio 模板
 #   ios/.gitignore       ← Xcode 产物 + cap sync 生成物
+
+# HarmonyOS NEXT 构建产物与同步目录
+hw/.hvigor/
+hw/build/
+hw/entry/build/
+hw/.cxx/
+hw/.preview/
+hw/oh_modules/
+hw/node_modules/
+hw/entry/src/main/resources/rawfile/*
+!hw/entry/src/main/resources/rawfile/.gitkeep

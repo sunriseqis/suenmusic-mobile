@@ -1,0 +1,14 @@
+{
+  "modelVersion": "5.0.0",
+  "name": "suenmusic-hw",
+  "version": "1.5.0",
+  "description": "SuenMusic 鸿蒙 NEXT 客户端工程（ArkTS / ArkUI Web 容器壳应用）",
+  "main": "",
+  "author": "SuenMusic Team",
+  "license": "MIT",
+  "dependencies": {},
+  "devDependencies": {
+    "@ohos/hypium": "1.0.18",
+    "@ohos/hvigor-ohos-plugin": "6.26.8"
+  }
+}

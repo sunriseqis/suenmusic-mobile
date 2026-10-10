@@ -1,0 +1,24 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "SuenMusic 鸿蒙客户端模块"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "SuenMusic 主入口"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "SuenMusic"
+    },
+    {
+      "name": "permission_internet_reason",
+      "value": "用于连接音乐服务端获取元数据、加载封面与音频流播放"
+    },
+    {
+      "name": "permission_keep_background_reason",
+      "value": "用于支持锁屏与退至后台时持续流畅播放音频"
+    }
+  ]
+}

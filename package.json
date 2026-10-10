@@ -2,7 +2,7 @@
   "name": "suenmusic-mobile",
   "version": "0.1.0",
   "private": true,
-  "description": "SuenMusic 移动端原生工程（Android + iOS）。前端/后端在同级的 suenmusic-server 仓库，构建前必须先把它检出在同一级目录下。",
+  "description": "SuenMusic 移动端原生工程（Android + iOS + HarmonyOS NEXT）。前端/后端在同级的 suenmusic-server 仓库，构建前必须先把它检出在同一级目录下。",
   "engines": {
     "node": ">=22.18"
   },
@@ -10,6 +10,9 @@
     "ios:sync": "node scripts/build-ios.mjs --sync-only",
     "ios:ipa": "node scripts/build-ios.mjs",
     "ios:ipa:unsigned": "node scripts/build-ios.mjs --unsigned",
-    "vendor:fix": "bash scripts/fix-ios-vendor.sh"
+    "vendor:fix": "bash scripts/fix-ios-vendor.sh",
+    "hw:sync": "node scripts/sync-hw.mjs",
+    "hw:hap": "node scripts/build-hw.mjs",
+    "hw:hap:unsigned": "node scripts/build-hw.mjs --unsigned"
   }
 }
