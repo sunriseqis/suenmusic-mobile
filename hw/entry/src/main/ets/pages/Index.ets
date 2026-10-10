@@ -68,8 +68,37 @@ class HarmonyAVSessionManager {
       await this.session.activate();
       hilog.info(DOMAIN, TAG, 'AVSession created and activated successfully');
       this.registerSessionListeners();
+      // 会话一建好就先给它一条**只有应用名**的最小元数据：系统要看到会话有
+      // 元数据才会在锁屏/播控中心给出那条控件。真曲目信息随后被覆盖。
+      // 这里写应用名而不是编一个歌名 —— 不知道就不知道，别骗系统。
+      await this.pushMinimalMetadata();
     } catch (err) {
       hilog.error(DOMAIN, TAG, 'Failed to create AVSession: %{public}s', JSON.stringify(err));
+    }
+  }
+
+  /**
+   * 推一条最小元数据（只有应用名），保证播控中心那条控件先出现。
+   *
+   * ⚠️ 同样遵守"不写 undefined 键"的规矩：只给 assetId/title/artist/album，
+   * 不碰 lyric 与 mediaImage。
+   */
+  private async pushMinimalMetadata(): Promise<void> {
+    const session = this.session;
+    if (!session) return;
+    const metadata: avSession.AVMetadata = {
+      assetId: 'suen_app',
+      title: 'SuenMusic',
+      artist: 'SuenMusic',
+      album: 'SuenMusic',
+      duration: 0
+    };
+    this.currentMetadata = metadata;
+    try {
+      await session.setAVMetadata(metadata);
+      hilog.info(DOMAIN, TAG, 'setAVMetadata(最小元数据) success');
+    } catch (err) {
+      hilog.error(DOMAIN, TAG, 'setAVMetadata(最小元数据) failed: %{public}s', JSON.stringify(err));
     }
   }
 
@@ -167,15 +196,29 @@ class HarmonyAVSessionManager {
       this.currentLyric = meta.lyric;
     }
 
+    // ⚠️⚠️ **绝不能把 undefined 的键塞进 AVMetadata**。
+    //
+    // 实测代价（2026-10-10）：旧代码这里写的是
+    //   `mediaImage: pixelMap || this.currentPixelMap || undefined, lyric: lyricStr || undefined`
+    // 那两次 setAVMetadata **一次都没成功过**（catch 里有日志但没人看到），于是
+    //   · 歌名一直是「未知曲目」—— 那是 updateLyric 里伪造的那条撑着的
+    //   · 封面永远拉不到 —— 封面逻辑压根没跑到
+    //   · 切歌后仍显示上一首 —— 元数据从未被更新
+    // 而那条伪造数据 `{assetId, title, lyric}` 之所以能成功，正因为它
+    // **一个 undefined 字段都没有**。所以这里改成"有值才赋键"。
     const metadata: avSession.AVMetadata = {
       assetId: assetId || 'suen_' + Date.now(),
       title: meta.title || '未知曲目',
       artist: meta.artist || '未知歌手',
       album: meta.album || 'SuenMusic',
-      duration: meta.durationMs || 0,
-      mediaImage: this.currentPixelMap || undefined,
-      lyric: this.currentLyric || undefined
+      duration: meta.durationMs || 0
     };
+    if (this.currentLyric) {
+      metadata.lyric = this.currentLyric;
+    }
+    if (this.currentPixelMap) {
+      metadata.mediaImage = this.currentPixelMap;
+    }
     this.currentMetadata = metadata;
 
     try {
@@ -296,7 +339,8 @@ class HarmonyAVSessionManager {
 
       const lyric = payload.lyric || '';
       this.currentLyric = lyric;
-      meta.lyric = lyric || undefined;
+      // 同上：绝不能赋 undefined。空字符串是"没有歌词"的正常表达。
+      meta.lyric = lyric;
 
       await session.setAVMetadata(meta);
       hilog.info(DOMAIN, TAG, 'setAVMetadata(歌词) success: assetId=%{public}s, len=%{public}d',
