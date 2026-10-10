@@ -55,7 +55,7 @@
           "abilities": [
             "EntryAbility"
           ],
-          "when": "always"
+          "when": "inuse"
         }
       }
     ]

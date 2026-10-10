@@ -1,7 +1,6 @@
 import { webview } from '@kit.ArkWeb';
-import { bundleManager } from '@kit.AbilityKit';
-import { common } from '@kit.AbilityKit';
-import { Want } from '@kit.AbilityKit';
+import { bundleManager, common, Want, wantAgent, WantAgent } from '@kit.AbilityKit';
+import { backgroundTaskManager } from '@kit.BackgroundTasksKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { avSession } from '@kit.AVSessionKit';
 import { http } from '@kit.NetworkKit';
@@ -18,6 +17,8 @@ class HarmonyAVSessionManager {
   private currentPixelMap: image.PixelMap | null = null;
   private currentCoverUrl: string = '';
   private currentMetadata: avSession.AVMetadata | null = null;
+  private isContinuousTaskRunning: boolean = false;
+  private stopTaskTimer: number = -1;
 
   constructor(context: common.UIAbilityContext, webviewController: webview.WebviewController) {
     this.context = context;
@@ -46,6 +47,11 @@ class HarmonyAVSessionManager {
     this.session.on('pause', () => {
       hilog.info(DOMAIN, TAG, 'AVSession received: pause');
       this.dispatchWebControl('pause');
+    });
+
+    this.session.on('stop', () => {
+      hilog.info(DOMAIN, TAG, 'AVSession received: stop');
+      this.dispatchWebControl('stop');
     });
 
     this.session.on('playNext', () => {
@@ -163,6 +169,55 @@ class HarmonyAVSessionManager {
     }
   }
 
+  private async getContinuousTaskWantAgent(): Promise<WantAgent> {
+    const bundleName = this.context.abilityInfo?.bundleName || 'com.suenmusic.app';
+    const abilityName = this.context.abilityInfo?.name || 'EntryAbility';
+    const wantAgentInfo: wantAgent.WantAgentInfo = {
+      wants: [
+        {
+          bundleName: bundleName,
+          abilityName: abilityName
+        }
+      ],
+      actionType: wantAgent.OperationType.START_ABILITY,
+      requestCode: 0,
+      actionFlags: [wantAgent.WantAgentFlags.UPDATE_PRESENT_FLAG]
+    };
+    return await wantAgent.getWantAgent(wantAgentInfo);
+  }
+
+  async startContinuousTask(): Promise<void> {
+    if (this.isContinuousTaskRunning) {
+      return;
+    }
+    try {
+      const agent = await this.getContinuousTaskWantAgent();
+      await backgroundTaskManager.startBackgroundRunning(
+        this.context,
+        backgroundTaskManager.BackgroundMode.AUDIO_PLAYBACK,
+        agent
+      );
+      this.isContinuousTaskRunning = true;
+      hilog.info(DOMAIN, TAG, 'Continuous task AUDIO_PLAYBACK started successfully');
+    } catch (err) {
+      hilog.error(DOMAIN, TAG, 'Failed to start continuous task: %{public}s', JSON.stringify(err));
+    }
+  }
+
+  async stopContinuousTask(): Promise<void> {
+    if (!this.isContinuousTaskRunning) {
+      return;
+    }
+    try {
+      await backgroundTaskManager.stopBackgroundRunning(this.context);
+      this.isContinuousTaskRunning = false;
+      hilog.info(DOMAIN, TAG, 'Continuous task AUDIO_PLAYBACK stopped successfully');
+    } catch (err) {
+      hilog.warn(DOMAIN, TAG, 'Failed to stop continuous task: %{public}s', JSON.stringify(err));
+      this.isContinuousTaskRunning = false;
+    }
+  }
+
   async updatePlaybackState(stateStr: string, positionMs?: number, durationMs?: number): Promise<void> {
     if (!this.session) return;
 
@@ -170,8 +225,26 @@ class HarmonyAVSessionManager {
       let state = avSession.PlaybackState.PLAYBACK_STATE_PAUSE;
       if (stateStr === 'playing') {
         state = avSession.PlaybackState.PLAYBACK_STATE_PLAY;
-      } else if (stateStr === 'stopped' || stateStr === 'idle') {
-        state = avSession.PlaybackState.PLAYBACK_STATE_STOP;
+        // 收到播放态：清除待停止定时器，并确保后台长时任务已启动（防止切后台被系统冻结挂起）
+        if (this.stopTaskTimer !== -1) {
+          clearTimeout(this.stopTaskTimer);
+          this.stopTaskTimer = -1;
+        }
+        await this.startContinuousTask();
+      } else if (stateStr === 'stopped' || stateStr === 'idle' || stateStr === 'paused') {
+        state = (stateStr === 'stopped' || stateStr === 'idle')
+          ? avSession.PlaybackState.PLAYBACK_STATE_STOP
+          : avSession.PlaybackState.PLAYBACK_STATE_PAUSE;
+
+        // 暂停或切歌间歇：延时 30 秒停止长时任务。
+        // 避免切歌缓冲、短暂停顿导致长时任务被立即注销而引发进程被冻结挂起。
+        // 若 30 秒内未恢复播放，则自动释放长时任务以满足系统能效审计要求。
+        if (this.stopTaskTimer === -1) {
+          this.stopTaskTimer = setTimeout(() => {
+            void this.stopContinuousTask();
+            this.stopTaskTimer = -1;
+          }, 30000);
+        }
       }
 
       const elapsed = Math.max(0, Math.round(positionMs || 0));
@@ -220,6 +293,11 @@ class HarmonyAVSessionManager {
   }
 
   async destroy(): Promise<void> {
+    if (this.stopTaskTimer !== -1) {
+      clearTimeout(this.stopTaskTimer);
+      this.stopTaskTimer = -1;
+    }
+    await this.stopContinuousTask();
     if (!this.session) return;
     try {
       if (this.currentPixelMap) {
