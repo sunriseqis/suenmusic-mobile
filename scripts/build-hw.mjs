@@ -80,6 +80,13 @@ async function assembleHap(versionName, versionCode) {
   log('3/3 执行 Hvigor 编译未签名 HAP...');
   const hvigorw = join(HW_DIR, 'hvigorw');
 
+  // `hvigorw` 是 bash 脚本（#!/usr/bin/env bash），Windows 不能直接 spawn，
+  // 只会报一个看不懂的 ENOEXEC/EACCES。CI 跑在 ubuntu 所以一直没暴露。
+  // 本地 Windows 请用 DevEco Studio 构建，或在 Git Bash / WSL 里跑本脚本。
+  if (process.platform === 'win32') {
+    fail('hvigorw 是 bash 脚本，Windows 上无法直接执行；请用 DevEco Studio 构建，或在 Git Bash / WSL 里运行本脚本。');
+  }
+
   const args = [
     'assembleHap',
     '--mode', 'module',

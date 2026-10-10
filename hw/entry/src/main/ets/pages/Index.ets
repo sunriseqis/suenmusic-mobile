@@ -441,14 +441,20 @@ class HarmonyAVSessionManager {
       }
 
       const elapsed = Math.max(0, Math.round(positionMs || 0));
+      const updateTime = new Date().getTime();
       const playbackState: avSession.AVPlaybackState = {
         state: state,
         position: {
           elapsedTime: elapsed,
-          updateTime: new Date().getTime()
+          updateTime: updateTime
         },
         duration: durationMs || 0
       };
+
+      // 留痕：锁屏歌词的滚动位置由这组数据推算（elapsed + updateTime 外推）。
+      // 一旦再出现"控件里比实际快/慢"，这行能直接看出是推的值不对还是外推不对。
+      hilog.info(DOMAIN, TAG, 'setAVPlaybackState: state=%{public}d, elapsed=%{public}d, updateTime=%{public}d',
+        state, elapsed, updateTime);
 
       await this.session.setAVPlaybackState(playbackState);
     } catch (err) {

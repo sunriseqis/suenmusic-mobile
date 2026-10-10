@@ -21,10 +21,17 @@ function log(msg) {
   console.log(`[sync-hw] ${msg}`);
 }
 
+/**
+ * Windows 上 npm 实际是 `npm.cmd`，而 `execFileSync` 不经过 shell，
+ * 按 `'npm'` 去 spawn 会直接 ENOENT（`spawnSync npm ENOENT`）。
+ * 这个坑在 CI 上看不见 —— build-hw.yml 跑在 ubuntu，命令名就是 `npm`。
+ */
+const NPM_CMD = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+
 // 1. 若 web/dist 不存在或包含未编译代码，先编译 Web
 if (!existsSync(join(DIST_DIR, 'index.html'))) {
   log('web/dist 产物不存在，开始执行 npm run build...');
-  execFileSync('npm', ['run', 'build'], { cwd: WEB_DIR, stdio: 'inherit' });
+  execFileSync(NPM_CMD, ['run', 'build'], { cwd: WEB_DIR, stdio: 'inherit' });
 }
 
 // 2. 准备目标 rawfile 目录
