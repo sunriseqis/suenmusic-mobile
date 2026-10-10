@@ -226,6 +226,17 @@ JS 侧 `window.SuenHarmony.updateMediaMetadata(...)` 发完不管、不 await）
   本地能做到的极限是**语法检查**：把 `struct` 换成 `class` 后用 TypeScript 解析器解析
   （`build()` 里的 `Column() { ... }` 是 ArkUI DSL、不是合法 TS，会有 **2 条预期假阳性**）。
 - 另外 `avSession` 的 `AVMetadata.lyric` 是存在的（能编译过），歌词那条路是通的。
+- **就算能编译，构建脚本本身也有 Windows 坑**（用户在 Windows 本地构建时踩到）：
+  - `scripts/sync-hw.mjs` 里 `execFileSync('npm', …)` 在 Windows 上直接
+    `spawnSync npm ENOENT` —— npm 实际是 `npm.cmd`，而 `execFileSync` 不经过 shell。
+    已改为按平台选 `npm.cmd` / `npm`。**CI 跑在 ubuntu，这类坑只会在本地暴露。**
+  - `scripts/build-hw.mjs` 里 `run(hvigorw, …)`：hvigorw 是 **bash 脚本**
+    （`#!/usr/bin/env bash`），Windows 不能直接 spawn，原来只报一个看不懂的
+    ENOEXEC/EACCES；已改成明确提示用 **DevEco Studio** 构建，或在 Git Bash / WSL 里跑。
+- **`hw/entry/src/main/resources/rawfile/` 是 gitignore 的构建产物**，仓库里只跟踪了
+  `.gitkeep`。新 clone / 另一台机器上它是**空的** → 页面加载不了 → 播控中心必然没有元数据，
+  表现为"控件完全消失"。CI 会自动跑 `node scripts/sync-hw.mjs`；
+  **本地用 DevEco 编之前必须先手动跑一次**（或 `npm run hw:sync`）。
 
 ### 44. 鸿蒙封面必须显式要二进制，且失败必须打日志
 - `httpRequest.request(url, {...})` **不指定 `expectDataType` 时拿到的可能是 `string`**，
@@ -245,6 +256,60 @@ JS 侧 `window.SuenHarmony.updateMediaMetadata(...)` 发完不管、不 await）
 - 设置页开关只在鸿蒙端显示；关掉时必须走 **force 路径**
   （`lyrics.setEnabled(false)` → `syncHarmonyLyric(id, '', true)`）把**已经推出去的歌词收回** ——
   否则关了开关，锁屏上还挂着歌词。
+
+### 46. 给系统 API 的结构体**不要塞 `undefined` 的键** —— 会被静默拒绝（2026-10-10 最贵的一课）
+- **现象**：`AVMetadata` 里写 `mediaImage: … || undefined`、`lyric: … || undefined`，
+  `setAVMetadata()` **每次都被拒**。而 catch 里有 `hilog.error` —— 但没人看到日志，
+  所以对外表现是"改了没反应"，不是"报错"。
+- **代价**（这一条同时解释了四个报障，它们**不是**四个 bug）：
+  | 报障 | 真实原因 |
+  |---|---|
+  | 歌名显示「未知曲目」 | 真元数据全被拒，播控中心里只剩另一条兜底数据 |
+  | 封面拉不到 | 封面逻辑在同一行之后，压根没跑到 |
+  | 切歌后仍显示上一首 | 元数据从未被更新过 |
+  | 去掉兜底后控件**完全消失** | 兜底一没，每次调用都带 `undefined` → 全部被拒 |
+- **修法**：**有值才赋键**。
+  ```ts
+  const metadata: avSession.AVMetadata = { assetId, title, artist, album, duration };
+  if (this.currentLyric) { metadata.lyric = this.currentLyric; }
+  if (this.currentPixelMap) { metadata.mediaImage = this.currentPixelMap; }
+  ```
+  清空歌词用**空字符串**，不要用 `undefined`。
+- **诊断法（下次直接照做）**：**回溯"唯一被证实成功过的那次调用"长什么样**。
+  本轮那条伪造数据 `{assetId, title, lyric}` 之所以能成功，正因为它**一个 undefined 字段都没有** ——
+  整个问题是被这个"唯一的幸存者"反推出来的。用户还提供了两条决定性描述：
+  「界面完全正常」（排除"页面没加载"）、「往上拉能看到正确时间轴、松开又弹回」
+  （说明**歌词数据是对的，错的是系统推算的播放位置**）。
+- 推广：ArkTS 里凡是**交给系统 API 的结构体**都适用；`try/catch` 里打了日志但没人能看时，
+  等价于没有日志 —— **让失败可观测**要在"调用之前"留痕（入口 + 关键参数），不是只在 catch 里。
+
+### 47. 播放位置必须**周期上报**，别让系统按锚点外推
+- 锁屏/播控中心的歌词滚动位置，是系统用 `AVPlaybackState.position`（`elapsedTime` +
+  `updateTime`）**自己外推**出来的。所以只在状态变化时上报，误差会随时间累积。
+- web 侧原来的 `timeupdate` 只更新了 store 里的 `positionMs`，**不上报**；上报只发生在
+  `play / pause / ended / loadedmetadata / canplay / durationchange / seek()`。
+  而 **`applyPendingSeek()`（续播跳转，`web/src/stores/player.ts:274`）直接改
+  `el.currentTime`、不经过 `seek()`**，于是锚点 stale。
+- 实测症状：控件里歌词比实际播放快 20 秒，而 App 内进度条是对的。
+- **修法**：`timeupdate` 里按 **1 秒节流**补一次上报（仅播放中）。锁屏时 `timeupdate`
+  依然触发（**媒体事件不受 JS 定时器节流影响**），所以后台/锁屏也能保持锚定。
+  这样无论 stale 锚点是被谁造成的，1 秒内都会重新锚定，误差 ≤1 秒。
+- `updateTime` 的**单位**至今没确认（SDK 约定查不到，暂按毫秒）。**这是刻意的取舍**：
+  用"1 秒重新锚定"把不确定性变得无关紧要 —— 单位就算错，误差也只在两次上报之间累积。
+  **架构上的选择可以消掉信息缺失**，这比先去查文档更划算。
+- 判断这类问题的关键问句：**"这个数据是我们在推，还是让对方猜？"** 凡是让系统猜的，
+  迟早会漂。
+
+### 48. 去掉一层兜底之前，先确认另一条路真的能承重
+- 本轮我按"不能伪造数据"的原则把 `updateLyric` 里那段兜底删掉了 —— 原则没错，
+  但**当时并没有确认 `updateMediaMetadata` 那条路是通的**（它其实一次都没成功过）。
+  结果：控件整条消失，用户只能回退重编一次。
+- **规则**：动"兜底 / 降级 / fallback"之前，先问一句
+  **"被我拿掉的这根拐杖，底下那条腿真的能承重吗？"**
+  要么先验证它（哪怕用日志证明它从没成功过），要么**两条路改成互不依赖**，
+  再删兜底 —— 后者的做法见第 42 条第 5 点（歌词消息也带完整元数据）。
+- 配套：**兜底数据本身也是数据**。它一旦被系统 UI 展示过，就会变成"用户看到的既有行为"，
+  删掉它是一次**行为变更**，不能算"清理"。
 
 ---
 
