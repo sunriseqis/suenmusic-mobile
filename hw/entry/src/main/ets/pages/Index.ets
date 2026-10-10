@@ -38,6 +38,19 @@ class HarmonyAVSessionManager {
   private currentPixelMap: image.PixelMap | null = null;
   private currentCoverUrl: string = '';
   private currentMetadata: avSession.AVMetadata | null = null;
+  /** 当前这首的 assetId。歌词只对"当时那首"有效，靠它判断一次歌词该不该收 */
+  private currentAssetId: string = '';
+  /** 当前这首的歌词。**单独存**，不再借"伪造一条 AVMetadata"来表达 */
+  private currentLyric: string = '';
+  /**
+   * 元数据上报的单调序号。
+   *
+   * 一次切歌会触发多次上报（加载时 + loadedmetadata），JS 侧是发完就不管
+   * （不 await），所以多个 async 调用会同时在飞 —— 谁最后 resolve 谁就赢。
+   * 封面下载走网络（超时预算 5s+5s），旧的那次如果晚回来就会把新歌覆盖，
+   * 表现就是「切歌后仍显示上一首」。只有序号等于最新值的结果才允许落地。
+   */
+  private metaSeq: number = 0;
   private isContinuousTaskRunning: boolean = false;
   private stopTaskTimer: number = -1;
 
@@ -105,81 +118,169 @@ class HarmonyAVSessionManager {
     }
   }
 
+  /**
+   * 推送曲目元数据（标题 / 歌手 / 专辑 / 时长）。
+   *
+   * 两条铁律，都是踩过的坑：
+   *
+   * 1) **绝不等封面**：封面下载走网络（超时预算 5s + 5s），把它 await 在
+   *    setAVMetadata 之前，会让"新歌的元数据被堵在慢网络后面"；而上一首那次
+   *    如果晚回来就会覆盖新歌 —— 表现就是「切歌后仍显示上一首」。
+   *    现在先推纯文本元数据（立刻生效），封面回来后异步再补一次。
+   *
+   * 2) **metaSeq 守卫**：一次切歌会触发多次上报，多个 async 调用同时在飞，
+   *    谁最后 resolve 谁就赢。只有序号仍是最新值的结果才允许落地。
+   */
   async updateMetadata(meta: MusicMetadataParam): Promise<void> {
-    if (!this.session) return;
-
-    let pixelMap: image.PixelMap | undefined = undefined;
-    const cover = meta.coverUrl ? meta.coverUrl.trim() : '';
-
-    if (cover && (cover.startsWith('http://') || cover.startsWith('https://'))) {
-      if (cover === this.currentCoverUrl && this.currentPixelMap) {
-        pixelMap = this.currentPixelMap;
-      } else {
-        pixelMap = await this.downloadCoverPixelMap(cover);
-        if (pixelMap) {
-          if (this.currentPixelMap && this.currentPixelMap !== pixelMap) {
-            try {
-              await this.currentPixelMap.release();
-            } catch (e) {
-              // ignore
-            }
-          }
-          this.currentPixelMap = pixelMap;
-          this.currentCoverUrl = cover;
-        }
-      }
+    const session = this.session;
+    if (!session) {
+      // 以前这里是静默 return —— 元数据被丢弃却毫无痕迹，极难排查
+      hilog.error(DOMAIN, TAG, '元数据被丢弃：AVSession 尚未就绪（assetId=%{public}s）',
+        meta.assetId || '');
+      return;
     }
 
-    let lyricStr = meta.lyric;
-    if (lyricStr === undefined && this.currentMetadata && this.currentMetadata.assetId === meta.assetId) {
-      lyricStr = this.currentMetadata.lyric;
+    const seq = ++this.metaSeq;
+    const assetId = meta.assetId || '';
+
+    // 换曲：上一首的歌词与封面立即作废（它们只对"当时那首"有效）
+    if (assetId !== this.currentAssetId) {
+      this.currentAssetId = assetId;
+      this.currentLyric = '';
+      this.currentCoverUrl = '';
+    }
+    if (meta.lyric) {
+      this.currentLyric = meta.lyric;
     }
 
     const metadata: avSession.AVMetadata = {
-      assetId: meta.assetId || 'suen_' + Date.now(),
+      assetId: assetId || 'suen_' + Date.now(),
       title: meta.title || '未知曲目',
       artist: meta.artist || '未知歌手',
       album: meta.album || 'SuenMusic',
       duration: meta.durationMs || 0,
-      mediaImage: pixelMap || this.currentPixelMap || undefined,
-      lyric: lyricStr || undefined
+      mediaImage: this.currentPixelMap || undefined,
+      lyric: this.currentLyric || undefined
     };
-
     this.currentMetadata = metadata;
 
     try {
-      await this.session.setAVMetadata(metadata);
-      hilog.info(DOMAIN, TAG, 'setAVMetadata success: title=%{public}s, hasCover=%{public}s, hasLyric=%{public}s',
-        metadata.title || '', (pixelMap || this.currentPixelMap) ? 'true' : 'false', metadata.lyric ? 'true' : 'false');
+      await session.setAVMetadata(metadata);
+      hilog.info(DOMAIN, TAG,
+        'setAVMetadata(文本) success: seq=%{public}d, title=%{public}s, artist=%{public}s, hasLyric=%{public}s',
+        seq, metadata.title || '', metadata.artist || '', metadata.lyric ? 'true' : 'false');
     } catch (err) {
-      hilog.error(DOMAIN, TAG, 'setAVMetadata failed: %{public}s', JSON.stringify(err));
+      hilog.error(DOMAIN, TAG, 'setAVMetadata(文本) failed: %{public}s', JSON.stringify(err));
+      return;
+    }
+
+    // 封面单独补，不阻塞上面的标题；回来后必须还是"最新一次"才认
+    this.attachCover(meta.coverUrl ? meta.coverUrl.trim() : '', seq);
+  }
+
+  /**
+   * 异步补封面。封面是这个链路里唯一走网络的一步，所以必须自带守卫：
+   * 下载期间用户又切了歌（seq 变了），这次的结果就属于旧曲目，连同已解码的
+   * PixelMap 一起丢弃 —— 否则旧封面会盖在新歌上。
+   */
+  private async attachCover(cover: string, seq: number): Promise<void> {
+    if (!cover) return;
+    if (!(cover.startsWith('http://') || cover.startsWith('https://'))) return;
+
+    let pixelMap: image.PixelMap | undefined = undefined;
+    if (cover === this.currentCoverUrl && this.currentPixelMap) {
+      pixelMap = this.currentPixelMap;
+    } else {
+      pixelMap = await this.downloadCoverPixelMap(cover);
+    }
+    if (!pixelMap) return;
+
+    if (seq !== this.metaSeq) {
+      hilog.info(DOMAIN, TAG, '封面到达时已切歌，丢弃（封面 seq=%{public}d，当前 seq=%{public}d）',
+        seq, this.metaSeq);
+      if (pixelMap !== this.currentPixelMap) {
+        try {
+          await pixelMap.release();
+        } catch (e) {
+          // ignore
+        }
+      }
+      return;
+    }
+
+    const session = this.session;
+    const meta = this.currentMetadata;
+    if (!session || !meta) return;
+
+    if (this.currentPixelMap && this.currentPixelMap !== pixelMap) {
+      try {
+        await this.currentPixelMap.release();
+      } catch (e) {
+        // ignore
+      }
+    }
+    this.currentPixelMap = pixelMap;
+    this.currentCoverUrl = cover;
+    meta.mediaImage = pixelMap;
+
+    try {
+      await session.setAVMetadata(meta);
+      hilog.info(DOMAIN, TAG, 'setAVMetadata(补封面) success: seq=%{public}d', seq);
+    } catch (err) {
+      hilog.error(DOMAIN, TAG, 'setAVMetadata(补封面) failed: %{public}s', JSON.stringify(err));
     }
   }
 
+  /**
+   * 更新歌词（系统锁屏 / 播控中心显示用）。
+   *
+   * ⚠️ 这里曾经在 currentMetadata 为空时**凭空造一条 AVMetadata** 推给系统
+   * （assetId 写死 'suen_current'、title 写死 '未知曲目'）。而 web 侧在 App
+   * 启动、队列为空、切歌时都会先推一条空歌词 —— 于是播控中心一上来就变成
+   * 「未知曲目」，还要等真正的元数据来覆盖它（而那次未必到）。
+   *
+   * 现在只记 currentLyric，**绝不伪造标题**：元数据还没来就先存着，
+   * 等 updateMetadata 到达时一并推出去。
+   */
   async updateLyric(assetId: string, lyricLrc: string): Promise<void> {
-    if (!this.session) return;
-
-    if (!this.currentMetadata) {
-      const initMeta: avSession.AVMetadata = {
-        assetId: assetId || 'suen_current',
-        title: '未知曲目',
-        lyric: lyricLrc
-      };
-      this.currentMetadata = initMeta;
-    } else {
-      if (!assetId || this.currentMetadata.assetId === assetId || this.currentMetadata.assetId.startsWith('suen_')) {
-        this.currentMetadata.lyric = lyricLrc;
-      } else {
-        return;
-      }
+    const session = this.session;
+    if (!session) {
+      hilog.error(DOMAIN, TAG, '歌词被丢弃：AVSession 尚未就绪');
+      return;
     }
 
+    // 元数据还没到：先存着，不碰系统 UI
+    const meta = this.currentMetadata;
+    if (!meta) {
+      this.currentLyric = assetId ? lyricLrc : '';
+      hilog.info(DOMAIN, TAG, '歌词先于元数据到达，暂存 %{public}d 字（assetId=%{public}s）',
+        this.currentLyric.length, assetId || '(空)');
+      return;
+    }
+
+    // 歌词属于"当前这首"才收。assetId 为空 = web 那边暂时没有曲目，
+    // 只清歌词，绝不动标题与封面。
+    if (assetId && assetId !== this.currentAssetId) {
+      hilog.info(DOMAIN, TAG,
+        '歌词与当前曲目不符，忽略（歌词 assetId=%{public}s，当前 assetId=%{public}s）',
+        assetId, this.currentAssetId || '(空)');
+      return;
+    }
+    if (!assetId && lyricLrc) {
+      // 没有 assetId 却带着歌词：来源不可信，丢弃
+      hilog.info(DOMAIN, TAG, '歌词缺少 assetId，忽略');
+      return;
+    }
+
+    this.currentLyric = lyricLrc;
+    meta.lyric = lyricLrc || undefined;
+
     try {
-      await this.session.setAVMetadata(this.currentMetadata);
-      hilog.info(DOMAIN, TAG, 'AVSession lyric updated for %{public}s, len=%{public}d',
-        this.currentMetadata.title || '', lyricLrc ? lyricLrc.length : 0);
+      await session.setAVMetadata(meta);
+      hilog.info(DOMAIN, TAG, 'setAVMetadata(歌词) success: assetId=%{public}s, len=%{public}d',
+        this.currentAssetId || '(空)', lyricLrc ? lyricLrc.length : 0);
     } catch (err) {
-      hilog.error(DOMAIN, TAG, 'Failed to update AVSession lyric: %{public}s', JSON.stringify(err));
+      hilog.error(DOMAIN, TAG, 'setAVMetadata(歌词) failed: %{public}s', JSON.stringify(err));
     }
   }
 
@@ -288,33 +389,54 @@ class HarmonyAVSessionManager {
     }
   }
 
+  /**
+   * 下载并解码封面为 PixelMap。
+   *
+   * ⚠️ 必须显式 `expectDataType: ARRAY_BUFFER`：不指定时拿到的可能是 string，
+   *    下面 `instanceof ArrayBuffer` 就永远为 false —— 封面永远拉不到，
+   *    而且旧代码在这条分支上**一行日志都不打**，是它最难排查的地方。
+   *    现在三种失败（非 200 / 拿到非二进制 / 解码抛异常）都会留下日志。
+   */
   private async downloadCoverPixelMap(url: string): Promise<image.PixelMap | undefined> {
+    const httpRequest = http.createHttp();
     try {
-      const httpRequest = http.createHttp();
       const response = await httpRequest.request(url, {
         method: http.RequestMethod.GET,
         connectTimeout: 5000,
         readTimeout: 5000,
+        expectDataType: http.HttpDataType.ARRAY_BUFFER,
         header: {
           'Referer': ''
         }
       });
 
-      if (response.responseCode === 200 && response.result instanceof ArrayBuffer) {
-        const imageSource = image.createImageSource(response.result);
-        const decodingOptions: image.DecodingOptions = {
-          desiredSize: { width: 512, height: 512 }
-        };
-        const pixelMap = await imageSource.createPixelMap(decodingOptions);
-        await imageSource.release();
-        httpRequest.destroy();
-        return pixelMap;
+      if (response.responseCode !== 200) {
+        hilog.error(DOMAIN, TAG, '封面下载失败：HTTP %{public}d（%{public}s）',
+          response.responseCode, url);
+        return undefined;
       }
-      httpRequest.destroy();
+
+      if (!(response.result instanceof ArrayBuffer)) {
+        hilog.error(DOMAIN, TAG,
+          '封面下载拿到的是非二进制内容（HTTP %{public}d）：expectDataType 未生效或上游返回了文本（%{public}s）',
+          response.responseCode, url);
+        return undefined;
+      }
+
+      const imageSource = image.createImageSource(response.result);
+      const decodingOptions: image.DecodingOptions = {
+        desiredSize: { width: 512, height: 512 }
+      };
+      const pixelMap = await imageSource.createPixelMap(decodingOptions);
+      await imageSource.release();
+      hilog.info(DOMAIN, TAG, '封面解码成功：%{public}s', url);
+      return pixelMap;
     } catch (err) {
-      hilog.error(DOMAIN, TAG, 'Failed to downloadCoverPixelMap from %{public}s: %{public}s', url, JSON.stringify(err));
+      hilog.error(DOMAIN, TAG, '封面下载/解码异常 %{public}s: %{public}s', url, JSON.stringify(err));
+      return undefined;
+    } finally {
+      httpRequest.destroy();
     }
-    return undefined;
   }
 
   async destroy(): Promise<void> {
