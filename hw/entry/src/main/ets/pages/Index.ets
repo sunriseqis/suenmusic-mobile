@@ -17,6 +17,7 @@ class HarmonyAVSessionManager {
   private webviewController: webview.WebviewController;
   private currentPixelMap: image.PixelMap | null = null;
   private currentCoverUrl: string = '';
+  private currentMetadata: avSession.AVMetadata | null = null;
 
   constructor(context: common.UIAbilityContext, webviewController: webview.WebviewController) {
     this.context = context;
@@ -84,6 +85,7 @@ class HarmonyAVSessionManager {
     album?: string;
     coverUrl?: string;
     durationMs?: number;
+    lyric?: string;
   }): Promise<void> {
     if (!this.session) return;
 
@@ -109,21 +111,55 @@ class HarmonyAVSessionManager {
       }
     }
 
+    let lyricStr = meta.lyric;
+    if (lyricStr === undefined && this.currentMetadata && this.currentMetadata.assetId === meta.assetId) {
+      lyricStr = this.currentMetadata.lyric;
+    }
+
     const metadata: avSession.AVMetadata = {
       assetId: meta.assetId || 'suen_' + Date.now(),
       title: meta.title || '未知曲目',
       artist: meta.artist || '未知歌手',
       album: meta.album || 'SuenMusic',
       duration: meta.durationMs || 0,
-      mediaImage: pixelMap || this.currentPixelMap || undefined
+      mediaImage: pixelMap || this.currentPixelMap || undefined,
+      lyric: lyricStr || undefined
     };
+
+    this.currentMetadata = metadata;
 
     try {
       await this.session.setAVMetadata(metadata);
-      hilog.info(DOMAIN, TAG, 'setAVMetadata success: title=%{public}s, hasCover=%{public}s',
-        metadata.title || '', (pixelMap || this.currentPixelMap) ? 'true' : 'false');
+      hilog.info(DOMAIN, TAG, 'setAVMetadata success: title=%{public}s, hasCover=%{public}s, hasLyric=%{public}s',
+        metadata.title || '', (pixelMap || this.currentPixelMap) ? 'true' : 'false', metadata.lyric ? 'true' : 'false');
     } catch (err) {
       hilog.error(DOMAIN, TAG, 'setAVMetadata failed: %{public}s', JSON.stringify(err));
+    }
+  }
+
+  async updateLyric(assetId: string, lyricLrc: string): Promise<void> {
+    if (!this.session) return;
+
+    if (!this.currentMetadata) {
+      this.currentMetadata = {
+        assetId: assetId || 'suen_current',
+        title: '未知曲目',
+        lyric: lyricLrc
+      };
+    } else {
+      if (!assetId || this.currentMetadata.assetId === assetId || this.currentMetadata.assetId.startsWith('suen_')) {
+        this.currentMetadata.lyric = lyricLrc;
+      } else {
+        return;
+      }
+    }
+
+    try {
+      await this.session.setAVMetadata(this.currentMetadata);
+      hilog.info(DOMAIN, TAG, 'AVSession lyric updated for %{public}s, len=%{public}d',
+        this.currentMetadata.title || '', lyricLrc ? lyricLrc.length : 0);
+    } catch (err) {
+      hilog.error(DOMAIN, TAG, 'Failed to update AVSession lyric: %{public}s', JSON.stringify(err));
     }
   }
 
@@ -280,6 +316,15 @@ class HarmonyBridge {
       hilog.error(DOMAIN, TAG, 'updatePlaybackState parse failed: %{public}s', JSON.stringify(err));
     }
   }
+
+  updateLyric(lyricJson: string): void {
+    try {
+      const data: Record<string, string> = JSON.parse(lyricJson);
+      this.avSessionManager.updateLyric(String(data.assetId || ''), String(data.lyric || ''));
+    } catch (err) {
+      hilog.error(DOMAIN, TAG, 'updateLyric parse failed: %{public}s', JSON.stringify(err));
+    }
+  }
 }
 
 @Entry
@@ -381,7 +426,8 @@ struct Index {
             'isNativePlatform',
             'getPlatform',
             'updateMediaMetadata',
-            'updatePlaybackState'
+            'updatePlaybackState',
+            'updateLyric'
           ],
           controller: this.webviewController
         })
