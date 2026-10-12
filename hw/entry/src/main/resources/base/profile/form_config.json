@@ -1,0 +1,28 @@
+{
+  "forms": [
+    {
+      "name": "SuenMusicNowPlaying",
+      "displayName": "正在播放",
+      "description": "显示当前播放的歌名、歌手与封面",
+      "src": "./ets/forms/SuenFormCard.ets",
+      "uiSyntax": "arkts",
+      "window": {
+        "autoDesignWidth": true,
+        "designWidth": 720
+      },
+      "colorMode": "auto",
+      "isDefault": true,
+      "updateEnabled": true,
+      "updateDuration": 30,
+      "defaultDimension": "2*2",
+      "supportDimensions": ["2*2", "2*4"],
+      "dataProxyEnabled": true,
+      "metadata": [
+        { "name": "suen_title", "value": "title" },
+        { "name": "suen_artist", "value": "artist" },
+        { "name": "suen_cover", "value": "coverUrl" },
+        { "name": "suen_playing", "value": "playing" }
+      ]
+    }
+  ]
+}

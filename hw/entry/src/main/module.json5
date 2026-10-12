@@ -37,6 +37,21 @@
         ]
       }
     ],
+    "extensionAbilities": [
+      {
+        "name": "SuenFormAbility",
+        "srcEntry": "./ets/forms/SuenFormAbility.ets",
+        "description": "$string:EntryAbility_desc",
+        "type": "form",
+        "exported": true,
+        "metadata": [
+          {
+            "name": "ohos.extension.form",
+            "resource": "$profile:form_config"
+          }
+        ]
+      }
+    ],
     "requestPermissions": [
       {
         "name": "ohos.permission.INTERNET",

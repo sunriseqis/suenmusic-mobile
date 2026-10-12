@@ -5,6 +5,8 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import { avSession } from '@kit.AVSessionKit';
 import { http } from '@kit.NetworkKit';
 import { image } from '@kit.ImageKit';
+import { formBindingData, formProvider, formInfo } from '@kit.FormKit';
+import { NowPlayingSnapshot, writeSnapshot, toCardPayload } from '../common/NowPlaying';
 
 const TAG = 'SuenMusic_IndexPage';
 const DOMAIN = 0x0000;
@@ -56,6 +58,12 @@ class HarmonyAVSessionManager {
   private metaSeq: number = 0;
   private isContinuousTaskRunning: boolean = false;
   private stopTaskTimer: number = -1;
+
+  // ---- 桌面卡片用的当前曲目（播放状态变化时不必等元数据重来一遍） ----
+  private isPlaying: boolean = false;
+  private currentCardTitle: string = '';
+  private currentCardArtist: string = '';
+  private currentCardCover: string = '';
 
   constructor(context: common.UIAbilityContext, webviewController: webview.WebviewController) {
     this.context = context;
@@ -231,8 +239,52 @@ class HarmonyAVSessionManager {
       return;
     }
 
+    // 桌面卡片跟着换歌（卡片进程读的是 preferences 里的快照，不是内存）
+    this.currentCardTitle = meta.title ? meta.title.trim() : '';
+    this.currentCardArtist = meta.artist ? meta.artist.trim() : '';
+    this.currentCardCover = meta.coverUrl ? meta.coverUrl.trim() : '';
+    this.syncCard(this.currentCardTitle, this.currentCardArtist, this.currentCardCover);
+
     // 封面单独补，不阻塞上面的标题；回来后必须还是"最新一次"才认
     this.attachCover(meta.coverUrl ? meta.coverUrl.trim() : '', seq);
+  }
+
+  /**
+   * 把"正在听什么"写进快照，并主动刷新所有桌面卡片。
+   *
+   * 为什么不靠卡片自己来取：卡片进程是**独立进程**，且 SDK 禁止在那里引用
+   * multimedia.media 等模块 —— 它只能被动接收。这里写快照 + updateForm，
+   * 才是卡片更新的主动来源（否则只能等 updateDuration 到点的 30 分钟定时刷新）。
+   *
+   * 失败不外抛：卡片是附加功能，不该因为它拖垮播控中心那条主链路。
+   */
+  private async syncCard(title: string, artist: string, coverUrl: string): Promise<void> {
+    const hasTrack = title.length > 0;
+    const snap: NowPlayingSnapshot = {
+      title: hasTrack ? title : '还没在听',
+      artist: hasTrack ? (artist.length > 0 ? artist : '未知歌手') : '打开 SuenMusic 放首歌',
+      coverUrl: hasTrack ? coverUrl : '',
+      playing: hasTrack && this.isPlaying,
+      updatedAt: new Date().getTime()
+    };
+    try {
+      await writeSnapshot(this.context, snap);
+      // 注意用的是 RunningFormInfo 而不是 FormInfo —— 后者没有 id 字段，
+      // 拿不到 formId 就没法 updateForm（实测踩过：'formId' does not exist）。
+      const infos: Array<formInfo.RunningFormInfo> = await formProvider.getPublishedRunningFormInfos();
+      if (infos.length === 0) return;
+      const binding = formBindingData.createFormBindingData(toCardPayload(snap));
+      for (const info of infos) {
+        formProvider.updateForm(info.formId, binding).catch((err: Error) => {
+          hilog.error(DOMAIN, TAG, '卡片刷新失败 formId=%{public}s: %{public}s',
+            info.formId, JSON.stringify(err));
+        });
+      }
+      hilog.info(DOMAIN, TAG, '已刷新 %{public}d 张桌面卡片：%{public}s',
+        infos.length, snap.title);
+    } catch (err) {
+      hilog.error(DOMAIN, TAG, 'syncCard 失败: %{public}s', JSON.stringify(err));
+    }
   }
 
   /**
@@ -457,6 +509,13 @@ class HarmonyAVSessionManager {
         state, elapsed, updateTime);
 
       await this.session.setAVPlaybackState(playbackState);
+
+      // 播放/暂停状态一变，卡片上的"播放中/已暂停"就该跟着变
+      const nowPlaying = state === avSession.PlaybackState.PLAYBACK_STATE_PLAY;
+      if (nowPlaying !== this.isPlaying) {
+        this.isPlaying = nowPlaying;
+        this.syncCard(this.currentCardTitle, this.currentCardArtist, this.currentCardCover);
+      }
     } catch (err) {
       hilog.error(DOMAIN, TAG, 'setAVPlaybackState failed: %{public}s', JSON.stringify(err));
     }
