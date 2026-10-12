@@ -221,11 +221,28 @@ JS 侧 `window.SuenHarmony.updateMediaMetadata(...)` 发完不管、不 await）
   **正确做法：去掉显式返回类型，交给类型推断**（`getWantAgent()` 的返回类型恰好就是 API 期望的那个）。
 - **`void expr` 非法**：`void this.stopContinuousTask()` 编译不过，直接写调用即可
   （`4d23276` 修的就是这个；注意别和 Android 那边 `void promise` 的写法混）。
-- **本地编译不了**：`build-hw.yml` 在容器 `ghcr.io/dalongzhuazi/harmonyos-ci:api26r` 里跑
-  `hvigorw assembleHap`，而沙箱**没有 docker、也没有鸿蒙 SDK** → 只能靠 CI 或本地 DevEco。
-  本地能做到的极限是**语法检查**：把 `struct` 换成 `class` 后用 TypeScript 解析器解析
-  （`build()` 里的 `Column() { ... }` 是 ArkUI DSL、不是合法 TS，会有 **2 条预期假阳性**）。
-- 另外 `avSession` 的 `AVMetadata.lyric` 是存在的（能编译过），歌词那条路是通的。
+- **~~本地编译不了~~ → ⚠️ 2026-10-12 已推翻：本地能编译 ArkTS**（见下方「鸿蒙工具链」节）。
+  `build-hw.yml` 用容器 `ghcr.io/dalongzhuazi/harmonyos-ci:api26r` 跑 `hvigorw assembleHap`，
+  但那个镜像的 SDK **本身就是一个公开 GitHub release**（`ErBWs/ohos-sdk v26.0.0.821`），
+  所以无头 Debian 直接装 tarball 就行，**不需要 docker、不需要 DevEco、不需要 GUI**。
+- **鸿蒙工具链（2026-10-12 装好，`/opt/command-line-tools`，7.1 GB，API 26 / SDK 26.0.0.821）**：
+  ```bash
+  . /etc/profile.d/harmonyos.sh    # DEVECO_SDK_HOME + PATH(bin/node/ohpm)
+  cd hw && hvigorw assembleHap --mode module -p product=default -p buildMode=debug --no-daemon
+  # → entry/build/default/outputs/default/entry-default-unsigned.hap（约 10 MB，本地 30 秒）
+  ```
+  安装要点（三个坑，缺一个就报错）：
+  1. SDK 分两个卷 `.aa` + `.ab`，**`cat` 起来才是完整 tar.gz**（官方 `.sha256` 校验的是合并后的结果）；
+  2. **`~/.npmrc` 必须有 `@ohos:registry=https://repo.harmonyos.com/npm/`** ——
+     `@ohos/hvigor-ohos-plugin` 只在这个 registry，ohpm.openharmony.cn 和 npmmirror 都没有（404）；
+     缺了它 hvigor 会在 `pnpm install` 阶段失败。
+  3. **必须 apt 装图形库**（`libgl1 libegl1 libgles2 libglx0 libglib2.0-0 libx11-6 libxext6
+     libxrender1 libxrandr2 libxfixes3 libxi6 libxcursor1 libxcomposite1 libxdamage1 libxtst6
+     libxkbcommon0 libgbm1 libdrm2 fontconfig fonts-dejavu-core`）——
+     缺 `libGL.so.1` 时 `CompileResource` 会报 `libimage_transcoder_shared.so` 加载失败。
+- 装好之后，**ArkTS 的类型检查/lint 全部本地可验**，不必再为"编译过一次"烧 CI 额度。
+  仍然本地验不了的只有**运行时行为**（歌词/封面/播控），那需要真机或模拟器。
+- `avSession` 的 `AVMetadata.lyric` 是存在的（能编译过），歌词那条路是通的。
 - **就算能编译，构建脚本本身也有 Windows 坑**（用户在 Windows 本地构建时踩到）：
   - `scripts/sync-hw.mjs` 里 `execFileSync('npm', …)` 在 Windows 上直接
     `spawnSync npm ENOENT` —— npm 实际是 `npm.cmd`，而 `execFileSync` 不经过 shell。
@@ -310,6 +327,31 @@ JS 侧 `window.SuenHarmony.updateMediaMetadata(...)` 发完不管、不 await）
   再删兜底 —— 后者的做法见第 42 条第 5 点（歌词消息也带完整元数据）。
 - 配套：**兜底数据本身也是数据**。它一旦被系统 UI 展示过，就会变成"用户看到的既有行为"，
   删掉它是一次**行为变更**，不能算"清理"。
+
+---
+
+### 49. 鸿蒙服务卡片（2026-10-12 起）：API 白名单机制 + 三处必须对上的 key
+- **卡片页（form application）的 API 面被编译器强制收窄**：JSDoc 里没有 `@form`
+  标签的声明一律报 `11706006 can't support form application`。
+  判定逻辑在 `ets-loader/lib/fast_build/system_api/api_check_define.js`。
+  **已实测被拒**（别再试）：`this.getUIContext()`、`hilog`、`router` / `router.getParams()`、
+  `AppStorage.get`、`StorageProp` / `StorageLink`；而且 `getFormBindingData` 在本 SDK
+  **根本不存在**。**在白名单里**：`@LocalStorageProp`、`postCardAction`、`vp2px`、
+  `animateTo`、`@Watch`、`@Computed`、`FormLink`。
+  → 推论：**卡片页不主动拉数据，数据由系统注入**。
+- **配置白名单可以直接问编译器**：往 `form_config.json` 写个非法字段，PreBuild 会把
+  合法字段全列出来。权威 schema 在 `toolchains/modulecheck/forms.json`。
+- **三个 key 必须同时对齐**（改一处要三处一起改）：
+  ① 推送对象的字段名 ② `form_config.json` 的 `metadata[].value`
+  ③ 卡片页 `@LocalStorageProp('key')` 的 key。所以做了一个共享转换函数
+  `common/NowPlaying.ets: toCardPayload()`，App 侧主动刷新与卡片侧生命周期共用。
+- **`getPublishedFormInfos()` 返回的 `FormInfo` 没有 `formId`**，拿 formId 必须用
+  `getPublishedRunningFormInfos()` → `RunningFormInfo.formId`。
+- 卡片注册：`module.extensionAbilities` 里 `type: "form"` + `metadata` 含
+  `name: "ohos.extension.form"` + `resource: "$profile:xxx"` → 解析到
+  `resources/base/profile/xxx.json`。卡片字节码单独打成 `ets/widgets.abc`。
+- ⚠️ **本条尚未在真机上验证通过**（2026-10-12 状态：骨架可添加、渲染正常，
+  数据未显示）。别把它当成"已跑通"的经验。
 
 ---
 
