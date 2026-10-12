@@ -452,6 +452,47 @@ JS 侧 `window.SuenHarmony.updateMediaMetadata(...)` 发完不管、不 await）
 
 ---
 
+### 54. 鸿蒙全项目体检（2026-10-12）：formImages 2MB 守卫是唯一实缺口
+- 体检结论：v5 全链路（call/router 分流、fd 生命周期、偏好跨进程同步、
+  @Builder 刷新、onClick 不冒泡）均无 bug；修复 4 处健壮性/规范性问题。
+- **formImages 单张 ≤2MB 没有守卫（唯一 P0）**：封面原始字节直接落盘，
+  某张大封面（如 3000px PNG）超限会导致 `updateForm` **整体失败** ——
+  不只是丢封面，标题/歌词/播放态全部停更。修法：落盘前查
+  `byteLength`，超限降级为「解码 512×512 → `image.createImagePacker()`
+  重编码 JPEG(quality 85)」再落盘（通常 <300KB）；压缩失败才放弃写盘
+  （卡片按无封面显示）。常量 `MAX_CARD_COVER_BYTES` 留 128KB 余量。
+- **SuenFormAbility.onUpdateForm 失败路径 fd 泄漏**：updateForm reject 时
+  原代码只打日志不关 fd。补 `closeCoverFd` 助手，成功/失败两条路都关。
+- **EntryAbility.pushSnapshotToCards 无条件开封面 fd**：coverReady=false
+  时仍开旧文件塞 formImages（payload 却说无封面）。与 Index.syncCard /
+  SuenFormAbility 对齐：`snap.coverReady ? openCoverFd : -1`。
+- **form_config `dataProxyEnabled` → false**：项目不用代理刷新
+  （无 `@suen_data`），声明与使用一致。
+- 明确不修（知会过）：`setWebDebuggingAccess(true)` 发布版建议关闭，
+  但 ArkTS 无条件编译手段，保留；onAddForm 的 fd 泄漏是官方模板同款
+  写法（返回值参与序列化不能提前关），Extension 进程空闲 10 秒回收；
+  `updateDuration: 30`（15 小时）仅作兜底，主动刷新走 updateForm，合法。
+
+---
+
+### 55. 鸿蒙 CI 构建约定（2026-10-12）：build-profile.json5 永远不带 signingConfigs
+- **DevEco Studio 自动签名会污染构建配置**：在 IDE 里点自动签名，
+  `C:\Users\<user>\.ohos\config\default_hw_*` 的**绝对路径**和 IDE 加密的
+  密文密码（`000000…`）会被写进根 `build-profile.json5`。提交进仓后 CI
+  （Linux）SignHap 直接炸：`00303107 Invalid storeFile value`。
+- **项目约定（用户拍板）**：本地不做生产编译，最终编译全在 CI；
+  **CI 产物就是未签名 HAP**，装入设备前由用户用自动签名工具处理。
+  因此根 `build-profile.json5` 必须**永远不含 `signingConfigs` 与
+  `products[].signingConfig` 引用**——任何人本地开了 DevEco 自动签名，
+  提交前必须检查这份文件有没有被 IDE 改脏。
+- 修法（本次）：删 signingConfigs 块 + products.signingConfig 引用 →
+  SignHap 变 no-op（2ms），`entry-default-unsigned.hap` 正常产出；
+  `.gitignore` 补 `.idea/`（IDE 缓存含本机绝对路径，同样不能进仓）。
+- 构建判定照旧：hvigor 末尾 `Lock is already released` + exitCode=1
+  是误报，以 `hvigor BUILD SUCCESSFUL` 为准。
+
+---
+
 ## 附：跨端交织、仍留在服务端仓库的相关节
 
 下面这些与移动端有关，但它们本身是**服务端 / Web / 移动端交织写**的 ——

@@ -117,7 +117,9 @@ export default class EntryAbility extends UIAbility {
    * 这里为简化在整批复送完后统一关（IPC 序列化时 fd 已被系统复制）。
    */
   private pushSnapshotToCards(snap: NowPlayingSnapshot): void {
-    const coverFd = openCoverFd(this.context);
+    // 与 Index.syncCard / SuenFormAbility 一致：只有快照声明封面就绪才开 fd，
+    // 否则 payload 说无封面却塞旧 formImages，既浪费也存在新旧不一致的边角。
+    const coverFd = snap.coverReady ? openCoverFd(this.context) : -1;
     formProvider.getPublishedRunningFormInfos()
       .then(async (infos: Array<formInfo.RunningFormInfo>) => {
         for (const info of infos) {

@@ -4,6 +4,7 @@ build/
 entry/build/
 .cxx/
 .preview/
+.idea/
 *.hvd
 *.hvd.temp
 

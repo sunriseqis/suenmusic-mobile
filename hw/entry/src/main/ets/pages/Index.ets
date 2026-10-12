@@ -22,6 +22,12 @@ const DOMAIN = 0x0000;
 const LOCAL_ORIGIN = 'http://localhost';
 /** 卡片封面文件（formImages 的数据源），与 FormExtensionAbility 共享沙箱 */
 const CARD_COVER_PATH = '/card_cover.img';
+/**
+ * formImages 单张文件的上限（ohos.app.form.formBindingData.d.ts：不超过 2MB）。
+ * 超限不处理的话 updateForm 整体失败 —— 不只是丢封面，标题/歌词/播放态
+ * 全部停在旧状态。留 128KB 余量防边界抖动。
+ */
+const MAX_CARD_COVER_BYTES = 2 * 1024 * 1024 - 128 * 1024;
 
 /**
  * web 侧送来的曲目信息。**两条消息共用同一个形状**：
@@ -428,7 +434,7 @@ class HarmonyAVSessionManager {
     }
 
     // 1) 字节落盘 —— 卡片 formImages 的数据源（失败只降级，不挡主链路）
-    this.coverFileReady = this.saveCoverFile(buffer);
+    this.coverFileReady = await this.saveCoverFile(buffer);
     if (!this.coverFileReady) {
       hilog.warn(DOMAIN, TAG, '封面落盘失败，卡片本次按无封面显示');
     }
@@ -463,13 +469,30 @@ class HarmonyAVSessionManager {
     this.syncCard();
   }
 
-  /** 把封面原始字节写进 cacheDir/card_cover.img（覆盖写） */
-  private saveCoverFile(buffer: ArrayBuffer): boolean {
+  /**
+   * 把封面字节写进 cacheDir/card_cover.img（覆盖写）。
+   *
+   * 2MB 守卫：formImages 单张超限会导致 updateForm 整体失败（卡片整卡停更）。
+   * 原始字节超限时降级为「解码 512×512 再重编码 JPEG」（通常 <300KB）后落盘；
+   * 压缩也失败才放弃本次写盘，卡片按无封面显示。
+   */
+  private async saveCoverFile(buffer: ArrayBuffer): Promise<boolean> {
+    let bytes = buffer;
+    if (buffer.byteLength > MAX_CARD_COVER_BYTES) {
+      hilog.warn(DOMAIN, TAG, '封面 %{public}d 字节超过 formImages 2MB 上限，降级压缩重编码',
+        buffer.byteLength);
+      const packed = await this.compressCoverBytes(buffer);
+      if (!packed) {
+        hilog.warn(DOMAIN, TAG, '封面压缩失败，卡片本次按无封面显示');
+        return false;
+      }
+      bytes = packed;
+    }
     let file: fileIo.File | null = null;
     try {
       const path = this.context.cacheDir + CARD_COVER_PATH;
       file = fileIo.openSync(path, fileIo.OpenMode.READ_WRITE | fileIo.OpenMode.CREATE | fileIo.OpenMode.TRUNC);
-      fileIo.writeSync(file.fd, buffer);
+      fileIo.writeSync(file.fd, bytes);
       return true;
     } catch (err) {
       hilog.error(DOMAIN, TAG, '封面落盘失败: %{public}s', JSON.stringify(err));
@@ -482,6 +505,30 @@ class HarmonyAVSessionManager {
           // ignore
         }
       }
+    }
+  }
+
+  /** 超限封面降级：解码 512×512 → JPEG(quality 85) 重编码。失败返回 undefined。 */
+  private async compressCoverBytes(buffer: ArrayBuffer): Promise<ArrayBuffer | undefined> {
+    const packer = image.createImagePacker();
+    try {
+      const source = image.createImageSource(buffer);
+      const decodingOptions: image.DecodingOptions = {
+        desiredSize: { width: 512, height: 512 }
+      };
+      const pixelMap = await source.createPixelMap(decodingOptions);
+      await source.release();
+      const packed = await packer.packing(pixelMap, {
+        format: 'image/jpeg',
+        quality: 85
+      });
+      await pixelMap.release();
+      return packed;
+    } catch (err) {
+      hilog.error(DOMAIN, TAG, '封面压缩重编码失败: %{public}s', JSON.stringify(err));
+      return undefined;
+    } finally {
+      packer.release();
     }
   }
 

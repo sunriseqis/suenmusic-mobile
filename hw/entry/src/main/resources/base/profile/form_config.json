@@ -16,7 +16,7 @@
       "updateDuration": 30,
       "defaultDimension": "2*2",
       "supportDimensions": ["2*2", "2*4"],
-      "dataProxyEnabled": true
+      "dataProxyEnabled": false
     }
   ]
 }

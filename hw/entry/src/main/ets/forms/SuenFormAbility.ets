@@ -55,6 +55,18 @@ export default class SuenFormAbility extends FormExtensionAbility {
     }
   }
 
+  /** 关 fd（-1 直接忽略）。成功/失败路径都要关，不留句柄泄漏。 */
+  private closeCoverFd(fd: number): void {
+    if (fd < 0) {
+      return;
+    }
+    try {
+      fileIo.closeSync(fd);
+    } catch (err) {
+      // ignore
+    }
+  }
+
   /**
    * 用户把卡片添加到桌面。
    *
@@ -95,17 +107,15 @@ export default class SuenFormAbility extends FormExtensionAbility {
           formBindingData.createFormBindingData(
             buildFormBindingObject(snap, dimension, coverFd))
         ).then(() => {
-          if (coverFd >= 0) {
-            try {
-              fileIo.closeSync(coverFd);
-            } catch (err) {
-              // ignore
-            }
-          }
+          this.closeCoverFd(coverFd);
+        }).catch((err: Error) => {
+          // 失败路径同样要关 fd：Extension 进程虽短命，也不留句柄泄漏
+          this.closeCoverFd(coverFd);
+          hilog.error(DOMAIN, TAG, 'updateForm 失败: %{public}s', JSON.stringify(err));
         });
       })
       .catch((err: Error) => {
-        hilog.error(DOMAIN, TAG, 'updateForm 失败: %{public}s', JSON.stringify(err));
+        hilog.error(DOMAIN, TAG, 'onUpdateForm 查询卡片信息失败: %{public}s', JSON.stringify(err));
       });
   }
 
