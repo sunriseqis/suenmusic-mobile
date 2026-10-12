@@ -350,8 +350,105 @@ JS 侧 `window.SuenHarmony.updateMediaMetadata(...)` 发完不管、不 await）
 - 卡片注册：`module.extensionAbilities` 里 `type: "form"` + `metadata` 含
   `name: "ohos.extension.form"` + `resource: "$profile:xxx"` → 解析到
   `resources/base/profile/xxx.json`。卡片字节码单独打成 `ets/widgets.abc`。
-- ⚠️ **本条尚未在真机上验证通过**（2026-10-12 状态：骨架可添加、渲染正常，
-  数据未显示）。别把它当成"已跑通"的经验。
+- ✅ 2026-10-12 模拟器实测通过：2*2 / 2*4 双布局渲染、四按钮控制
+  （call → EntryAbility callee → WebView）、点击信息区翻转歌词。
+  冷启动（杀进程后按卡片）与封面显示见第 50 条。
+
+---
+
+### 50. 鸿蒙卡片二轮（2026-10-12）：call 冷启动生命周期、formImages 封面、歌词滚动
+- **call 事件冷启动不执行 `onWindowStageCreate`**（官方 UIAbility 生命周期文档：
+  call 是 startAbilityByCall 语义 = onCreate → onBackground；拉到前台才走
+  onNewWant → onWindowStageCreate → onForeground）。所以「杀进程后卡片按播放
+  无效」的根因不是指令没到，而是 **WebView 永远不加载、pending 队列永远不
+  放行**。修法尝试：`callee('control')` 里 dispatch 后检查 `isWebPageReady()`，
+  没就绪就 `context.startAbility` 自拉前台。**实测（模拟器）被拒 code=201**：
+  `START_ABILITIES_FROM_BACKGROUND` 仅系统应用可申请，**call 链起自用户点击
+  也不豁免**。最终修法见第 51 条（router 通道）。
+- **卡片 `Image` 不能加载网络 URL**，官方通路是 formImages：
+  应用侧把字节落到沙箱（`cacheDir/card_cover.img`，与 FormExtensionAbility
+  共享同一沙箱）→ 推送前开 fd → `{'formImages': {'key': fd}}` 随
+  `createFormBindingData` 传 → 卡片 `Image('memory://key')`。
+  限制：单图 ≤2MB、API19 前最多 5 张。**fd 生命周期**：`updateForm` 的
+  await 之后关闭安全（IPC 已复制）；`onAddForm` 的返回值要参与序列化，
+  **不能提前关**（泄漏的这一个 fd 随 Extension 进程回收）。
+- **`@kit.CoreFileKit` 导出的是 `fileIo` 不是 `fs`**，`import { fs }` 直接编译
+  报错；API 同 `@ohos.file.fs`。
+- **卡片歌词按时间轴滚动**：web 侧本来就每 ~1s 上报 positionMs
+  （timeupdate 1 秒节流），Harmony 侧把它写进快照，只在**活跃歌词行变化**
+  时才推卡片 —— 逐秒推既费 IPC 也不平滑。窗口 = 当前行-1 起共 5 行，
+  `suen_lyric_active` 传当前行在窗口内的下标。
+- **陈旧快照两处修**：① 播放键改发 `'toggle'`（进程被杀后快照残留播放态时，
+  play/pause 二选一会判错方向，toggle 两种情况都对）；②
+  `EntryAbility.onDestroy` 把快照 playing 置 false 并推卡，**全走同步 API**
+  （`writeSnapshotSync`）—— onDestroy 没有等异步 flush 的时间预算。
+  注意 onDestroy 只覆盖「最近任务划掉」，系统杀进程不保证回调。
+- **卡片 UI 对齐设计体系**（✅ 模拟器实测：封面显示正确、歌词滚动正常）：
+  应用软拟物令牌的原生映射 —— `resources/base` 与 `resources/dark` 双份
+  `color.json`（bg/t1/t2/accent/accent-text/sd/sl 与 tokens.css 一一对应），
+  深浅色自动切换。ArkUI 一道 `.shadow()` 的限制下，双向阴影用
+  **两层同底色圆叠放、各投一道单向阴影**合成。
+  （全铺沉浸布局后被 v3「封面块」布局取代，见第 51 条。）
+- ⚠️ 冷启动实测失败（code=201），修复转第 51 条。
+
+---
+
+### 51. 鸿蒙卡片三轮（2026-10-12）：router 通道、@Builder 传参固化坑、布局 v3
+- **卡片控制按钮的通道是 call/router 按 `suen_alive` 分流（四轮定稿）**：
+  call 冷启动走不通（第 50 条 201 实测），router 又会"应用活着也拉前台"
+  （用户实测投诉）。定稿：应用每次推卡把 `suen_alive='true'` 发给卡片、
+  onDestroy 置 false；卡片按它分流——活着走 call（后台直达不惊动前台），
+  死了走 router（冷启动完整拉起，`want.parameters['control']` 交 Hub 排队）。
+  系统杀进程（onDestroy 不保证回调）留下陈旧 true 时：call 冷启动路径
+  检测到「WebView 未就绪 && 刚冷启动」→ **丢弃该指令（不排队，避免与下次
+  router 指令叠加成两次 toggle 抵消）**并纠正 alive=false 推回卡片，
+  用户第二次点击走 router。第一次点击被丢弃是已知代价。
+- **@Builder 按值传参的 UI 不随状态刷新**（ArkUI 文档明示的坑）：
+  上一版把 `isPlaying() ? pause : play` 图标当参数传进 `ctrlBtn`，首次
+  构建后被固化 → **播放键永远显示 play**（模拟器实测症状）。修法：图标/
+  颜色/尺寸全部在 @Builder **体内**经 `this.xxx`（@LocalStorageProp）计算。
+- **卡片 API 白名单内可用的通用属性**（SDK d.ts 带 `@form` 标注，编译期
+  白名单校验）：`blur` / `backdropBlur` / `backgroundBlurStyle` /
+  `linearGradient` / `shadow` / `animateTo`。毛玻璃面板用 backdropBlur，
+  歌词面背景用 blur 都可行。
+- 新增色板 `card_well`（无封面占位底）：浅 `#DDE4EE` / 深 `#252B36`。
+
+---
+
+### 52. 鸿蒙卡片四轮（2026-10-12）：布局 v4 —— alive 分流、方卡沉浸、歌词面整套切换
+- **2*2 方卡正面 = 封面全铺沉浸 + 底部毛玻璃圆角面板**：封面大幅完整
+  （v3 的 layoutWeight 条带裁切被用户投诉"非常难看"），标题/歌手/控制排
+  装进 `backdropBlur(25)` + `rgba(12,16,24,0.38)` 的磨砂面板 ——
+  文字落在磨砂上，可读性靠毛玻璃而不是加深渐变。
+- **翻转 = 整套布局切换，不是同骨架换文字**（用户明确要求）：背面两规格
+  同构切到「封面模糊沉浸」—— 封面全铺 `.blur(12)` + 深色渐变，标题/歌手
+  在上、歌词窗口居中（当前行高亮）、控制排在下。正面→背面观感完全不同。
+- **调色板二分**：`onDarkOverlay()` = hasCover && (showBack || !isWide) ——
+  歌词面与方卡正面的按钮/文字用固定深色令牌（#2B313C/#FF8B4A/#E9EDF4…），
+  2*4 正面与无封面态用主题资源令牌（自动深浅色）。所有取色方法以此为轴。
+- NowPlaying 快照/payload 新增 `alive` 字段（全链路：interface / empty /
+  readSnapshotSync 归一化 / CardPayload / toCardPayload /
+  buildFormBindingObject）；NowPlaying 导出 `openCoverFd`/`closeCoverFd`
+  助手，EntryAbility 纠正 alive 推卡时带封面 fd，避免 formImages 缺失丢封面。
+- EntryAbility：`justColdStarted` 标志（onCreate 置 true、
+  onWindowStageCreate 置 false）区分「call 冷启动撞陈旧 alive」与
+  「应用活着但 WebView 还在加载」（后者照常排队）；onDestroy 同时重置
+  playing 与 alive；`pushSnapshotToCards` 复用推卡逻辑。
+
+---
+
+### 53. 鸿蒙卡片五轮（2026-10-12）：布局 v5 —— 用户拍板的减法
+- **2*2 不支持翻转**（用户拍板：尺寸不够完整显示歌词，不如不要）。
+  点击非按钮区 = postCardAction router 直接打开应用（不带控制指令）。
+- **2*4 正面不显示歌词**（歌词只属于翻转页）：左封面块 + 右标题/歌手 +
+  控制排，`justifyContent(SpaceBetween)`。
+- **翻转页（仅 2*4）= 纯歌词页**（参考官方播放器歌词页）：封面模糊
+  沉浸 + 渐变，标题/歌手居中在上，歌词 6 行居中铺满（`textAlign(Center)`，
+  修掉左对齐右侧大片空白），**不放控制排** —— 控制排会压住底部歌词行
+  （v4 实测：下 2 行被挡）。CARD_WINDOW_LINES 5→6。
+  当前行**放大加粗**（14 Bold vs 11 Normal）+ 高亮色，视觉焦点随播滚动。
+- 教训：小尺寸卡片的"多用途"（翻转/歌词塞进方卡）是伪需求，
+  官方卡片每个规格只做一件事。
 
 ---
 

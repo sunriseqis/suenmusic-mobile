@@ -16,13 +16,7 @@
       "updateDuration": 30,
       "defaultDimension": "2*2",
       "supportDimensions": ["2*2", "2*4"],
-      "dataProxyEnabled": true,
-      "metadata": [
-        { "name": "suen_title", "value": "title" },
-        { "name": "suen_artist", "value": "artist" },
-        { "name": "suen_cover", "value": "coverUrl" },
-        { "name": "suen_playing", "value": "playing" }
-      ]
+      "dataProxyEnabled": true
     }
   ]
 }

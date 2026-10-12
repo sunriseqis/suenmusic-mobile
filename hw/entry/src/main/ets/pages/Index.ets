@@ -5,12 +5,23 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import { avSession } from '@kit.AVSessionKit';
 import { http } from '@kit.NetworkKit';
 import { image } from '@kit.ImageKit';
+import { fileIo } from '@kit.CoreFileKit';
 import { formBindingData, formProvider, formInfo } from '@kit.FormKit';
-import { NowPlayingSnapshot, writeSnapshot, toCardPayload } from '../common/NowPlaying';
+import {
+  NowPlayingSnapshot,
+  writeSnapshot,
+  buildFormBindingObject,
+  LyricLine,
+  parseLyricLines,
+  activeLyricIndex
+} from '../common/NowPlaying';
+import { attachWebviewController, markWebPageReady } from '../common/PlayerControlHub';
 
 const TAG = 'SuenMusic_IndexPage';
 const DOMAIN = 0x0000;
 const LOCAL_ORIGIN = 'http://localhost';
+/** 卡片封面文件（formImages 的数据源），与 FormExtensionAbility 共享沙箱 */
+const CARD_COVER_PATH = '/card_cover.img';
 
 /**
  * web 侧送来的曲目信息。**两条消息共用同一个形状**：
@@ -28,6 +39,14 @@ interface MusicMetadataParam {
   coverUrl?: string;
   durationMs?: number;
   lyric?: string;
+  /** 当前曲目是否已收藏（web 侧收藏集合的已知状态） */
+  favorite?: boolean;
+}
+
+/** web 侧收藏变化上报的形状（SuenHarmony.updateFavorite） */
+interface FavoriteUpdateParam {
+  assetId?: string;
+  favorite?: boolean;
 }
 
 interface PlaybackStateJsonData {
@@ -64,6 +83,19 @@ class HarmonyAVSessionManager {
   private currentCardTitle: string = '';
   private currentCardArtist: string = '';
   private currentCardCover: string = '';
+  /** 当前曲目是否已收藏（web 收藏集合的已知状态，卡片红心用） */
+  private currentFavorite: boolean = false;
+  /** 当前播放位置（毫秒）。web 每 ~1s 上报一次，卡片歌词靠它滚动 */
+  private currentPositionMs: number = 0;
+  /** 封面字节是否已落盘（卡片 formImages 的前提） */
+  private coverFileReady: boolean = false;
+  /** 最新下载的封面原始字节（写盘 + 解码共用一次下载） */
+  private cachedCoverBuffer: ArrayBuffer | undefined = undefined;
+  /** 卡片上次推送时的歌词活跃行（-2 = 尚未算过；行变化才推卡片） */
+  private lastCardLyricIndex: number = -2;
+  /** LRC 解析缓存：currentLyric 变了才重 parse */
+  private lyricCacheSource: string = '';
+  private lyricCacheLines: LyricLine[] = [];
 
   constructor(context: common.UIAbilityContext, webviewController: webview.WebviewController) {
     this.context = context;
@@ -194,14 +226,20 @@ class HarmonyAVSessionManager {
     const seq = ++this.metaSeq;
     const assetId = meta.assetId || '';
 
-    // 换曲：上一首的歌词与封面立即作废（它们只对"当时那首"有效）
+    // 换曲：上一首的歌词、封面、收藏状态立即作废（它们只对"当时那首"有效）
     if (assetId !== this.currentAssetId) {
       this.currentAssetId = assetId;
       this.currentLyric = '';
       this.currentCoverUrl = '';
+      this.currentFavorite = false;
+      this.coverFileReady = false;
+      this.lastCardLyricIndex = -2;
     }
     if (meta.lyric) {
       this.currentLyric = meta.lyric;
+    }
+    if (meta.favorite !== undefined) {
+      this.currentFavorite = meta.favorite;
     }
 
     // ⚠️⚠️ **绝不能把 undefined 的键塞进 AVMetadata**。
@@ -243,7 +281,7 @@ class HarmonyAVSessionManager {
     this.currentCardTitle = meta.title ? meta.title.trim() : '';
     this.currentCardArtist = meta.artist ? meta.artist.trim() : '';
     this.currentCardCover = meta.coverUrl ? meta.coverUrl.trim() : '';
-    this.syncCard(this.currentCardTitle, this.currentCardArtist, this.currentCardCover);
+    this.syncCard();
 
     // 封面单独补，不阻塞上面的标题；回来后必须还是"最新一次"才认
     this.attachCover(meta.coverUrl ? meta.coverUrl.trim() : '', seq);
@@ -256,84 +294,194 @@ class HarmonyAVSessionManager {
    * multimedia.media 等模块 —— 它只能被动接收。这里写快照 + updateForm，
    * 才是卡片更新的主动来源（否则只能等 updateDuration 到点的 30 分钟定时刷新）。
    *
+   * 封面走官方 formImages 机制（卡片 Image 不能加载网络 URL）：
+   * 字节先落盘 cacheDir/card_cover.img → 每次推送前开 fd →
+   * `{'formImages': {'suen_cover_img': fd}}` 随 payload 一起送 →
+   * 卡片侧 Image('memory://suen_cover_img') 显示。fd 在 IPC 中被系统
+   * 复制，await updateForm 之后关掉自己这份是安全的。
+   *
    * 失败不外抛：卡片是附加功能，不该因为它拖垮播控中心那条主链路。
    */
-  private async syncCard(title: string, artist: string, coverUrl: string): Promise<void> {
-    const hasTrack = title.length > 0;
+  private async syncCard(): Promise<void> {
+    const hasTrack = this.currentCardTitle.length > 0;
     const snap: NowPlayingSnapshot = {
-      title: hasTrack ? title : '还没在听',
-      artist: hasTrack ? (artist.length > 0 ? artist : '未知歌手') : '打开 SuenMusic 放首歌',
-      coverUrl: hasTrack ? coverUrl : '',
+      title: hasTrack ? this.currentCardTitle : '还没在听',
+      artist: hasTrack ? (this.currentCardArtist.length > 0 ? this.currentCardArtist : '未知歌手') : '打开 SuenMusic 放首歌',
+      coverUrl: hasTrack ? this.currentCardCover : '',
       playing: hasTrack && this.isPlaying,
+      favorite: hasTrack && this.currentFavorite,
+      lyric: hasTrack ? this.currentLyric : '',
+      positionMs: this.currentPositionMs,
+      coverReady: hasTrack && this.coverFileReady,
+      alive: true,
       updatedAt: new Date().getTime()
     };
+    // 封面 fd：文件就绪才开，失败降级为无封面（卡片画占位块）
+    let coverFd = -1;
+    if (snap.coverReady) {
+      coverFd = this.openCoverFd();
+    }
     try {
       await writeSnapshot(this.context, snap);
       // 注意用的是 RunningFormInfo 而不是 FormInfo —— 后者没有 id 字段，
       // 拿不到 formId 就没法 updateForm（实测踩过：'formId' does not exist）。
       const infos: Array<formInfo.RunningFormInfo> = await formProvider.getPublishedRunningFormInfos();
-      if (infos.length === 0) return;
-      const binding = formBindingData.createFormBindingData(toCardPayload(snap));
+      if (infos.length === 0) {
+        return;
+      }
       for (const info of infos) {
-        formProvider.updateForm(info.formId, binding).catch((err: Error) => {
+        const obj = buildFormBindingObject(snap, this.dimensionOfForm(info), coverFd);
+        try {
+          // await 之后系统已在 IPC 中复制 fd，可以安全关闭自己这份
+          await formProvider.updateForm(info.formId, formBindingData.createFormBindingData(obj));
+        } catch (err) {
           hilog.error(DOMAIN, TAG, '卡片刷新失败 formId=%{public}s: %{public}s',
             info.formId, JSON.stringify(err));
-        });
+        }
       }
-      hilog.info(DOMAIN, TAG, '已刷新 %{public}d 张桌面卡片：%{public}s',
-        infos.length, snap.title);
+      hilog.info(DOMAIN, TAG, '已刷新 %{public}d 张桌面卡片：%{public}s（封面 fd=%{public}d）',
+        infos.length, snap.title, coverFd);
     } catch (err) {
       hilog.error(DOMAIN, TAG, 'syncCard 失败: %{public}s', JSON.stringify(err));
+    } finally {
+      this.closeCoverFd(coverFd);
     }
+  }
+
+  /** 打开卡片封面文件的 fd（-1 = 文件不存在/打开失败，调用方按无封面降级） */
+  private openCoverFd(): number {
+    try {
+      const file = fileIo.openSync(this.context.cacheDir + CARD_COVER_PATH, fileIo.OpenMode.READ_ONLY);
+      return file.fd;
+    } catch (err) {
+      hilog.warn(DOMAIN, TAG, '封面文件打开失败（卡片按无封面降级）：%{public}s', JSON.stringify(err));
+      return -1;
+    }
+  }
+
+  private closeCoverFd(fd: number): void {
+    if (fd < 0) {
+      return;
+    }
+    try {
+      fileIo.closeSync(fd);
+    } catch (err) {
+      // 关 fd 失败无须处理：fd 生命周期随进程结束
+    }
+  }
+
+  /** 当前歌词的活跃行下标（带 LRC 解析缓存；positionMs 由 web 每秒上报） */
+  private currentLyricActiveIndex(positionMs: number): number {
+    if (this.lyricCacheSource !== this.currentLyric) {
+      this.lyricCacheSource = this.currentLyric;
+      this.lyricCacheLines = parseLyricLines(this.currentLyric);
+    }
+    return activeLyricIndex(this.lyricCacheLines, positionMs);
+  }
+
+  /** 卡片规格 → CardPayload 的 dimension 字符串（与 formInfo.FormDimension 数值一致） */
+  private dimensionOfForm(info: formInfo.RunningFormInfo): string {
+    return info.dimension === formInfo.FormDimension.Dimension_2_4 ? '3' : '2';
+  }
+
+  /**
+   * web 侧收藏状态变化上报（SuenHarmony.updateFavorite）。
+   *
+   * assetId 与当前曲目不符时忽略 —— 上报者（收藏页批量操作等）不知道
+   * "正在播哪首"，过滤这一层放在这里。
+   */
+  updateFavorite(assetId: string, favorite: boolean): void {
+    if (assetId.length === 0 || assetId !== this.currentAssetId) {
+      hilog.info(DOMAIN, TAG, '收藏上报与非当前曲目不符，忽略（assetId=%{public}s）', assetId);
+      return;
+    }
+    if (this.currentFavorite === favorite) return;
+    this.currentFavorite = favorite;
+    this.syncCard();
   }
 
   /**
    * 异步补封面。封面是这个链路里唯一走网络的一步，所以必须自带守卫：
    * 下载期间用户又切了歌（seq 变了），这次的结果就属于旧曲目，连同已解码的
    * PixelMap 一起丢弃 —— 否则旧封面会盖在新歌上。
+   *
+   * 一次下载两用：原始字节写盘（卡片 formImages 用）+ 解码成 PixelMap
+   * （播控中心 mediaImage 用）。写盘失败只降级卡片（画占位块），不阻塞
+   * 播控中心那条主链路。
    */
   private async attachCover(cover: string, seq: number): Promise<void> {
     if (!cover) return;
     if (!(cover.startsWith('http://') || cover.startsWith('https://'))) return;
 
-    let pixelMap: image.PixelMap | undefined = undefined;
-    if (cover === this.currentCoverUrl && this.currentPixelMap) {
-      pixelMap = this.currentPixelMap;
+    let buffer: ArrayBuffer | undefined = undefined;
+    if (cover === this.currentCoverUrl && this.currentPixelMap && this.cachedCoverBuffer) {
+      buffer = this.cachedCoverBuffer;
     } else {
-      pixelMap = await this.downloadCoverPixelMap(cover);
+      buffer = await this.downloadCoverData(cover);
     }
-    if (!pixelMap) return;
+    if (!buffer) return;
 
     if (seq !== this.metaSeq) {
       hilog.info(DOMAIN, TAG, '封面到达时已切歌，丢弃（封面 seq=%{public}d，当前 seq=%{public}d）',
         seq, this.metaSeq);
-      if (pixelMap !== this.currentPixelMap) {
-        try {
-          await pixelMap.release();
-        } catch (e) {
-          // ignore
-        }
-      }
       return;
     }
 
+    // 1) 字节落盘 —— 卡片 formImages 的数据源（失败只降级，不挡主链路）
+    this.coverFileReady = this.saveCoverFile(buffer);
+    if (!this.coverFileReady) {
+      hilog.warn(DOMAIN, TAG, '封面落盘失败，卡片本次按无封面显示');
+    }
+
+    // 2) 解码 PixelMap 给播控中心
+    const pixelMap = await this.decodeCoverPixelMap(buffer);
     const session = this.session;
-    const meta = this.currentMetadata;
-    if (!session || !meta) return;
+    if (!session || !pixelMap) {
+      // 播控中心拿不到封面不算失败：卡片那份已经准备好了
+      this.syncCard();
+      return;
+    }
 
     // ⚠️ **不释放** this.currentPixelMap：它已经被交给系统播控中心当作
     // mediaImage 了，释放正在被系统持有的 PixelMap 有让那条控件渲染失败的
     // 风险。旧的那张交给 GC 回收即可（每张 512×512，代价可接受）。
-    // 上面"已切歌"分支里释放的是**从未交给过系统**的那张，所以那里是安全的。
     this.currentPixelMap = pixelMap;
     this.currentCoverUrl = cover;
-    meta.mediaImage = pixelMap;
+    this.cachedCoverBuffer = buffer;
+    const meta = this.currentMetadata;
+    if (meta) {
+      meta.mediaImage = pixelMap;
+    }
 
     try {
       await session.setAVMetadata(meta);
       hilog.info(DOMAIN, TAG, 'setAVMetadata(补封面) success: seq=%{public}d', seq);
     } catch (err) {
       hilog.error(DOMAIN, TAG, 'setAVMetadata(补封面) failed: %{public}s', JSON.stringify(err));
+    }
+    // 3) 卡片补推：封面从"无"变"有"，卡片需要拿到 formImages 才显示得了
+    this.syncCard();
+  }
+
+  /** 把封面原始字节写进 cacheDir/card_cover.img（覆盖写） */
+  private saveCoverFile(buffer: ArrayBuffer): boolean {
+    let file: fileIo.File | null = null;
+    try {
+      const path = this.context.cacheDir + CARD_COVER_PATH;
+      file = fileIo.openSync(path, fileIo.OpenMode.READ_WRITE | fileIo.OpenMode.CREATE | fileIo.OpenMode.TRUNC);
+      fileIo.writeSync(file.fd, buffer);
+      return true;
+    } catch (err) {
+      hilog.error(DOMAIN, TAG, '封面落盘失败: %{public}s', JSON.stringify(err));
+      return false;
+    } finally {
+      if (file) {
+        try {
+          fileIo.closeSync(file);
+        } catch (err) {
+          // ignore
+        }
+      }
     }
   }
 
@@ -397,6 +545,9 @@ class HarmonyAVSessionManager {
       await session.setAVMetadata(meta);
       hilog.info(DOMAIN, TAG, 'setAVMetadata(歌词) success: assetId=%{public}s, len=%{public}d',
         this.currentAssetId || '(空)', lyric.length);
+
+      // 卡片背面显示的歌词跟这一条是同一份 —— 歌词到了就顺带刷卡片
+      this.syncCard();
     } catch (err) {
       // 同 updateMetadata：JS 桥不 await，异常绝不能抛回去
       hilog.error(DOMAIN, TAG, 'updateLyric 异常: %{public}s', JSON.stringify(err));
@@ -510,11 +661,20 @@ class HarmonyAVSessionManager {
 
       await this.session.setAVPlaybackState(playbackState);
 
+      // web 每 ~1 秒上报一次 positionMs —— 卡片歌词按时间轴滚动靠它。
+      // 只在活跃行变化时才推卡片：卡片刷新走 IPC，逐秒推既浪费也不平滑。
+      this.currentPositionMs = elapsed;
+      const activeIdx = this.currentLyricActiveIndex(elapsed);
+      if (activeIdx !== this.lastCardLyricIndex) {
+        this.lastCardLyricIndex = activeIdx;
+        this.syncCard();
+      }
+
       // 播放/暂停状态一变，卡片上的"播放中/已暂停"就该跟着变
       const nowPlaying = state === avSession.PlaybackState.PLAYBACK_STATE_PLAY;
       if (nowPlaying !== this.isPlaying) {
         this.isPlaying = nowPlaying;
-        this.syncCard(this.currentCardTitle, this.currentCardArtist, this.currentCardCover);
+        this.syncCard();
       }
     } catch (err) {
       hilog.error(DOMAIN, TAG, 'setAVPlaybackState failed: %{public}s', JSON.stringify(err));
@@ -522,14 +682,14 @@ class HarmonyAVSessionManager {
   }
 
   /**
-   * 下载并解码封面为 PixelMap。
+   * 下载封面原始字节。
    *
    * ⚠️ 必须显式 `expectDataType: ARRAY_BUFFER`：不指定时拿到的可能是 string，
    *    下面 `instanceof ArrayBuffer` 就永远为 false —— 封面永远拉不到，
    *    而且旧代码在这条分支上**一行日志都不打**，是它最难排查的地方。
    *    现在三种失败（非 200 / 拿到非二进制 / 解码抛异常）都会留下日志。
    */
-  private async downloadCoverPixelMap(url: string): Promise<image.PixelMap | undefined> {
+  private async downloadCoverData(url: string): Promise<ArrayBuffer | undefined> {
     const httpRequest = http.createHttp();
     try {
       const response = await httpRequest.request(url, {
@@ -554,20 +714,31 @@ class HarmonyAVSessionManager {
           response.responseCode, url);
         return undefined;
       }
+      hilog.info(DOMAIN, TAG, '封面下载成功：%{public}s（%{public}d 字节）',
+        url, response.result.byteLength);
+      return response.result;
+    } catch (err) {
+      hilog.error(DOMAIN, TAG, '封面下载异常 %{public}s: %{public}s', url, JSON.stringify(err));
+      return undefined;
+    } finally {
+      httpRequest.destroy();
+    }
+  }
 
-      const imageSource = image.createImageSource(response.result);
+  /** 解码封面字节为 PixelMap（播控中心 mediaImage 用） */
+  private async decodeCoverPixelMap(buffer: ArrayBuffer): Promise<image.PixelMap | undefined> {
+    try {
+      const imageSource = image.createImageSource(buffer);
       const decodingOptions: image.DecodingOptions = {
         desiredSize: { width: 512, height: 512 }
       };
       const pixelMap = await imageSource.createPixelMap(decodingOptions);
       await imageSource.release();
-      hilog.info(DOMAIN, TAG, '封面解码成功：%{public}s', url);
+      hilog.info(DOMAIN, TAG, '封面解码成功');
       return pixelMap;
     } catch (err) {
-      hilog.error(DOMAIN, TAG, '封面下载/解码异常 %{public}s: %{public}s', url, JSON.stringify(err));
+      hilog.error(DOMAIN, TAG, '封面解码异常: %{public}s', JSON.stringify(err));
       return undefined;
-    } finally {
-      httpRequest.destroy();
     }
   }
 
@@ -658,7 +829,8 @@ class HarmonyBridge {
       album: String(data.album || ''),
       coverUrl: String(data.coverUrl || ''),
       durationMs: Number(data.durationMs || 0),
-      lyric: String(data.lyric || '')
+      lyric: String(data.lyric || ''),
+      favorite: data.favorite === true
     };
   }
 
@@ -697,6 +869,18 @@ class HarmonyBridge {
       hilog.error(DOMAIN, TAG, 'updateLyric parse failed: %{public}s', JSON.stringify(err));
     }
   }
+
+  /** web 侧收藏状态变化上报（toggle 后、收藏集合拉全纠偏后都会调） */
+  updateFavorite(favJson: string): void {
+    try {
+      const data = JSON.parse(favJson) as FavoriteUpdateParam;
+      hilog.info(DOMAIN, TAG, '收到收藏上报: assetId=%{public}s, favorite=%{public}s',
+        String(data.assetId || ''), data.favorite === true ? 'true' : 'false');
+      this.avSessionManager.updateFavorite(String(data.assetId || ''), data.favorite === true);
+    } catch (err) {
+      hilog.error(DOMAIN, TAG, 'updateFavorite parse failed: %{public}s', JSON.stringify(err));
+    }
+  }
 }
 
 @Entry
@@ -721,6 +905,8 @@ struct Index {
     } catch (err) {
       hilog.warn(DOMAIN, TAG, 'Failed to set web debugging: %{public}s', JSON.stringify(err));
     }
+    // 把 controller 挂给卡片控制中枢：桌面卡片按钮的指令从那里分发进来
+    attachWebviewController(this.webviewController);
     this.avSessionManager.init();
   }
 
@@ -799,7 +985,8 @@ struct Index {
             'getPlatform',
             'updateMediaMetadata',
             'updatePlaybackState',
-            'updateLyric'
+            'updateLyric',
+            'updateFavorite'
           ],
           controller: this.webviewController
         })
@@ -864,6 +1051,9 @@ struct Index {
           }
         })
         .onPageEnd(() => {
+          // 网页加载完成：脚本已执行、__suenAudioControl 已注册。
+          // 桌面卡片积压的控制指令从这里开始放行。
+          markWebPageReady();
           // 注入安全区高度与平台全局标记
           const topPx = px2vp(this.topAvoidHeight);
           const bottomPx = px2vp(this.bottomAvoidHeight);

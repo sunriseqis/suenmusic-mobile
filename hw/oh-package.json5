@@ -7,8 +7,5 @@
   "author": "SuenMusic Team",
   "license": "MIT",
   "dependencies": {},
-  "devDependencies": {
-    "@ohos/hypium": "1.0.18",
-    "@ohos/hvigor-ohos-plugin": "6.26.8"
-  }
+  "devDependencies": {}
 }

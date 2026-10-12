@@ -1,0 +1,40 @@
+{
+  "color": [
+    {
+      "name": "card_bg",
+      "value": "#2B313C"
+    },
+    {
+      "name": "card_t1",
+      "value": "#E9EDF4"
+    },
+    {
+      "name": "card_t2",
+      "value": "#A5B0C2"
+    },
+    {
+      "name": "card_accent",
+      "value": "#FF8B4A"
+    },
+    {
+      "name": "card_accent_text",
+      "value": "#FF8B4A"
+    },
+    {
+      "name": "card_accent_on",
+      "value": "#2B1A0E"
+    },
+    {
+      "name": "card_sd",
+      "value": "#9E000000"
+    },
+    {
+      "name": "card_sl",
+      "value": "#12FFFFFF"
+    },
+    {
+      "name": "card_well",
+      "value": "#252B36"
+    }
+  ]
+}
