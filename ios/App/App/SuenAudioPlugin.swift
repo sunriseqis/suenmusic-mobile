@@ -110,8 +110,25 @@ public class SuenAudioPlugin: CAPPlugin, CAPBridgedPlugin {
             // NWPathMonitor 的回调在 utility 队列上（见 NetworkMonitor.start），
             // 这里必须走统一出口切回主线程，否则会卡死 WebKit（白屏）
             self?.emit("networkChanged", ["type": type])
+            if type == "available" {
+                // 断网恢复 / 切网（WiFi↔蜂窝）：缓存下载里卡住的请求
+                // 立即换轨续拉，不等 30 秒空闲超时
+                AudioCacheStore.shared.retryStalledDownloads()
+            }
         }
         networkMonitor.start()
+
+        // 回前台：断网 / 切网期间停在死路径上的缓存下载立即续拉
+        //（弱网热启动卡顿修复，与上面的 networkChanged 触发互补）
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(appDidBecomeActive(_:)),
+            name: UIApplication.didBecomeActiveNotification, object: nil)
+    }
+
+    /// 回前台触发点：只负责唤醒卡住的缓存下载；Web 端的重探测由
+    /// visibilitychange/pageshow 钩子自己完成（P0-1），两边互不依赖。
+    @objc private func appDidBecomeActive(_ notification: Notification) {
+        AudioCacheStore.shared.retryStalledDownloads()
     }
 
     /// Web 端排好队的整条队列：条目（id+元数据）+ 起始位置 + 流会话凭据。
@@ -1299,19 +1316,26 @@ enum CoverCache {
 final class NetworkMonitor {
     private let monitor = NWPathMonitor()
     private var lastSatisfied: Bool?
+    private var lastInterfaceType: NWInterface.InterfaceType?
     var onChange: ((String) -> Void)?
 
     func start() {
         monitor.pathUpdateHandler = { [weak self] path in
-            let satisfied = path.status == .satisfied
             guard let self = self else { return }
-            guard let last = self.lastSatisfied else {
+            let satisfied = path.status == .satisfied
+            let interfaceType = path.availableInterfaces.first?.type
+            guard let lastSatisfied = self.lastSatisfied else {
                 // 首次回调只记录基线，不发事件（对齐 Android：只报"变化"）
                 self.lastSatisfied = satisfied
+                self.lastInterfaceType = interfaceType
                 return
             }
-            guard satisfied != last else { return }
+            // WiFi↔蜂窝切换时 satisfied 始终为 true，只靠连通性翻转报不出
+            // "切网"事件；接口类型变化也要报 —— 停在旧路径上的请求
+            //（缓存下载、Web 端探测）等的就是这个信号
+            guard satisfied != lastSatisfied || interfaceType != self.lastInterfaceType else { return }
             self.lastSatisfied = satisfied
+            self.lastInterfaceType = interfaceType
             self.onChange?(satisfied ? "available" : "lost")
         }
         monitor.start(queue: DispatchQueue.global(qos: .utility))

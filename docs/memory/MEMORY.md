@@ -493,6 +493,62 @@ JS 侧 `window.SuenHarmony.updateMediaMetadata(...)` 发完不管、不 await）
 
 ---
 
+### 56. 卡片按钮失效根因（2026-10-15）：修复提交了但没 push，且提交在另一份工作区副本
+- **所有 CI 构建的卡片播放键/红心键都是死的**：卡片发 `toggle`/`favorite`，
+  Hub 把 favorite 映射成 `toggleFavorite()`，但 CI 产出的 web 里
+  `__suenAudioControl` 只有 `play/pause/stop/next/prev/seek` ——
+  `runJavaScript` 里 TypeError **静默失败**（catch 只打 hilog，界面零反馈）。
+- **真相（10/15 晚补正）**：web 修复用户 10/12 就提交了 —— D 盘仓库
+  （GitHub Desktop）`0699613 适配鸿蒙卡片页`，但**只 commit 未 push**。
+  C 盘工作区取证 `git log -S` / `git fsck` 全空 → 一度误判"从未提交"。
+  实际是**单机双工作区**：`D:\github\suenmusic\`（用户提交区）与
+  `C:\Users\Administrator\suenmusic\`（AI 构建区）互不相通。
+- **教训**：① 排查"改动去哪了"必须覆盖**所有本地副本**的未 push 提交
+  （`git log origin/main..HEAD`），单看一个工作区 + 远端会误判；
+  ② 跨仓库配套改动（web + native 各一半）要双侧同一条提交链落地并
+  push，CI 才认；③ 记忆文档写「已改」前先 `git status`/`git log -S`
+  确认，写「已提交」前还要确认 push 了没有、在哪份副本。
+- 修复落地：web = 用户的 `0699613`（全局注册 `registerGlobalAudioControl`
+  + `toggle()` 走 `ensureAudio`，冷启动窗口按键不空操作；收藏上报在
+  `favorites.ts`）；C 盘已从 D 盘同步。10/15 AI 的 watch 版作废。
+
+---
+
+### 57. AVSession 自愈（2026-10-15）：挂起恢复要重新 activate，6600102 走重建
+- **系统机制**（faqs-avsession-23 + 长时任务文档）：后台音频被打断/冻结后
+  系统会**自动停掉长时任务**，重启播放需再次申请；播控中心命令要
+  **AVSession 激活**才生效；会话被销毁时 set* 全部报 **6600102
+  "The session does not exist"**；非激活态的后台播放会被**静音并冻结**，
+  切回前台才解除（对应"恢复后播一两秒就停"）。
+- 自愈三板斧（Index.ets `HarmonyAVSessionManager`）：
+  1. paused→playing 转换时 `session.activate()`（幂等，白调不亏）；
+  2. activate/setAVPlaybackState 报 6600102 → `rebuildSession()`：
+     销毁旧句柄（失败吞掉）→ createAVSession + activate +
+     重注册监听 → 重放缓存的元数据与播放态；
+  3. `rebuildingSession` 标志防重建递归；最新播放态靠下一个 ~1s
+     的进度上报自然补齐，不手动重试。
+- web 侧配合：timeupdate 每 ~1s 上报一次 'playing' 态 —— 这是自愈的
+  心跳，别删。
+
+---
+
+### 58. 弱网/热启动卡顿修复（2026-10-15 定稿并执行完毕）
+
+诊断定性 + P0 web 四项 + P1 iOS 方案**完整存档在
+`docs/memory/2026-10-15.md` §六（含执行清单勾稽与 P1 落地细节）**。
+要点：热启动零重选触发点（补 visibilitychange/pageshow →
+`onNetworkEnvironmentChanged`）、多候选默认超时 20s→8s、`probeStream`
+创建了 AbortController 却没挂定时器（真 bug）、`isPrivateIpUrl` 不认
+IPv6 ULA（`client.ts`/`servers.ts` **两份重复实现同修**）。P1 iOS：
+`StreamCacheDownloader.retryNow()`（stalled>1.5s 才中止、`manualRestart`
+不占 `maxAttempts` 预算）+ 回前台/`networkChanged` 双触发 +
+`NetworkMonitor` 补接口切换检测（WiFi↔蜂窝 satisfied 不变、原实现
+报不出切网）。构建链已验证（web build ✅ → sync-hw → hw BUILD
+SUCCESSFUL）；iOS Swift 无法在 Windows 编译，待 Xcode/CI。遵守
+failover 约束（2026-09-14 拍板的保守策略 + `FAILOVER_COOLDOWN_MS=3000`）。
+
+---
+
 ## 附：跨端交织、仍留在服务端仓库的相关节
 
 下面这些与移动端有关，但它们本身是**服务端 / Web / 移动端交织写**的 ——

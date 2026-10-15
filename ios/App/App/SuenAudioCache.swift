@@ -324,6 +324,12 @@ final class StreamCacheDownloader: NSObject, URLSessionDataDelegate {
     private var cancelled = false
     /// 落盘失败的降级标志：停止缓存下载，让客户端下次请求重新决策
     private var diskBroken = false
+    /// 网络环境变化（回前台 / 断网恢复 / 切网）触发的手动重启标记：
+    /// `didCompleteWithError` 优先识别它，续拉**不消耗** attempts 预算
+    private var manualRestart = false
+    /// 最近一次收到上游数据的时刻：`retryNow` 只中止真正卡住的请求
+    private var lastDataAt = Date()
+    private static let stallThreshold: TimeInterval = 1.5
 
     init(entry: AudioCacheEntry, store: AudioCacheStore,
          requestBuilder: @escaping (Int64) -> URLRequest?) {
@@ -355,6 +361,21 @@ final class StreamCacheDownloader: NSObject, URLSessionDataDelegate {
         task?.cancel()
         session?.invalidateAndCancel()
         session = nil
+    }
+
+    /// 回前台 / 网络环境变化时调用：卡住的在途请求立即中止并从已落盘位置续拉，
+    /// 不等 `timeoutIntervalForRequest` 的 30 秒空闲超时 —— 切网后旧请求
+    /// 大概率停在死路径上，等满 30 秒就是用户感知的"热启动卡顿"。
+    /// 数据仍在正常流入的请求不动：中止它只会白白多一次 Range 请求。
+    func retryNow() {
+        guard !cancelled, !diskBroken, session != nil,
+              let task = task, task.state == .running else { return }
+        guard Date().timeIntervalSince(lastDataAt) > Self.stallThreshold else { return }
+        manualRestart = true
+        // 防抖：触发事件可能连发（NWPathMonitor 切网抖动），新请求必须再
+        // 积攒 stallThreshold 的"无数据"证据才会被下一次 retryNow 打断
+        lastDataAt = Date()
+        task.cancel()
     }
 
     private func startTask(on session: URLSession) {
@@ -431,6 +452,7 @@ final class StreamCacheDownloader: NSObject, URLSessionDataDelegate {
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         guard !data.isEmpty else { return }
+        lastDataAt = Date()
         if !entry.append(data) {
             cacheLog("download", "\(entry.id) 落盘失败，停止缓存下载")
             diskBroken = true
@@ -443,6 +465,22 @@ final class StreamCacheDownloader: NSObject, URLSessionDataDelegate {
         let stored = entry.storedBytes
         let reachedTotal = upstreamTotal > 0 && stored >= upstreamTotal
         let truncated = error != nil || (upstreamTotal > 0 && stored < upstreamTotal)
+
+        if manualRestart {
+            manualRestart = false
+            if reachedTotal {
+                // cancel 恰好落在收尾瞬间：直接按完成收尾，不进下面的续拉分支
+                entry.finish(complete: true)
+                session.finishTasksAndInvalidate()
+                self.session = nil
+                store?.downloadFinished(id: entry.id)
+                return
+            }
+            cacheLog("download",
+                     "\(entry.id) 网络环境变化，中止在途请求并立即续拉（已落盘 \(stored) 字节）")
+            retry(from: stored)
+            return
+        }
 
         if truncated && attempts < Self.maxAttempts && !diskBroken {
             attempts += 1
@@ -597,6 +635,16 @@ final class AudioCacheStore {
         downloader?.detach()
         if let entry = entry { saveSidecar(entry) }
         enforceLimit(protecting: id)
+    }
+
+    /// 回前台 / 网络环境变化：在途下载里真正卡住的请求立即换轨续拉。
+    /// 原本它们要等 `timeoutIntervalForRequest` 的 30 秒空闲超时才会自愈，
+    /// 切网后旧请求停在死路径上，等满 30 秒就是用户感知的"热启动卡顿"。
+    func retryStalledDownloads() {
+        dictLock.lock()
+        let list = Array(downloaders.values)
+        dictLock.unlock()
+        for downloader in list { downloader.retryNow() }
     }
 
     // MARK: 对外查询

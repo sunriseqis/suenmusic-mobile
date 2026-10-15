@@ -2,6 +2,7 @@ import { webview } from '@kit.ArkWeb';
 import { bundleManager, common, Want, wantAgent } from '@kit.AbilityKit';
 import { backgroundTaskManager } from '@kit.BackgroundTasksKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
+import { BusinessError } from '@kit.BasicServicesKit';
 import { avSession } from '@kit.AVSessionKit';
 import { http } from '@kit.NetworkKit';
 import { image } from '@kit.ImageKit';
@@ -83,6 +84,8 @@ class HarmonyAVSessionManager {
   private metaSeq: number = 0;
   private isContinuousTaskRunning: boolean = false;
   private stopTaskTimer: number = -1;
+  /** 会话重建中标志：防止重建内部的失败再次触发重建（递归风暴） */
+  private rebuildingSession: boolean = false;
 
   // ---- 桌面卡片用的当前曲目（播放状态变化时不必等元数据重来一遍） ----
   private isPlaying: boolean = false;
@@ -120,6 +123,88 @@ class HarmonyAVSessionManager {
       await this.pushMinimalMetadata();
     } catch (err) {
       hilog.error(DOMAIN, TAG, 'Failed to create AVSession: %{public}s', JSON.stringify(err));
+    }
+  }
+
+  /**
+   * 暂停 → 播放 的恢复时刻，重新激活 AVSession。
+   *
+   * 应用长时间后台挂起期间，系统可能把会话去激活甚至销毁（错误码 6600102
+   * "The session does not exist"）—— 播控中心控件消失、锁屏按钮失灵的根源。
+   * activate() 幂等，多调一次没有代价；会话已不存在则走 rebuildSession() 重建。
+   */
+  private async reactivateSession(): Promise<void> {
+    const session = this.session;
+    if (!session) return;
+    try {
+      await session.activate();
+      hilog.info(DOMAIN, TAG, 'session re-activated on play transition');
+    } catch (err) {
+      const be = err as BusinessError;
+      if (be.code === 6600102) {
+        hilog.warn(DOMAIN, TAG, 'session gone (6600102) on activate, rebuilding');
+        await this.rebuildSession();
+      } else {
+        hilog.warn(DOMAIN, TAG, 'session.activate failed: %{public}s', JSON.stringify(err));
+      }
+    }
+  }
+
+  /**
+   * 重建 AVSession（自愈路径，对应 6600102 会话不存在）。
+   *
+   * 旧句柄先销毁（可能已随系统清理失效，失败属预期，吞掉），
+   * 再走一遍 init 的建会话流程，并把缓存的元数据 / 播放态重放一遍 ——
+   * 不重放的话新会话是空的，播控中心有了控件却没有内容。
+   * 播放态在下一个 ~1s 的进度上报里自然会被最新值覆盖，这里只求"尽快像样"。
+   */
+  private async rebuildSession(): Promise<void> {
+    if (this.rebuildingSession) return;
+    this.rebuildingSession = true;
+    const old = this.session;
+    this.session = null;
+    if (old) {
+      try {
+        await old.destroy().catch((e: BusinessError) => {
+          hilog.warn(DOMAIN, TAG, 'old session destroy failed (expected if already gone): %{public}s',
+            JSON.stringify(e));
+        });
+      } catch {
+        /* ignore */
+      }
+    }
+    try {
+      this.session = await avSession.createAVSession(this.context, 'SuenMusicSession', 'audio');
+      await this.session.activate();
+      this.registerSessionListeners();
+      hilog.warn(DOMAIN, TAG, 'AVSession rebuilt successfully');
+      if (this.currentMetadata) {
+        try {
+          await this.session.setAVMetadata(this.currentMetadata);
+        } catch (err) {
+          hilog.error(DOMAIN, TAG, 'replay setAVMetadata failed: %{public}s', JSON.stringify(err));
+        }
+      }
+      try {
+        const state = this.isPlaying
+          ? avSession.PlaybackState.PLAYBACK_STATE_PLAY
+          : avSession.PlaybackState.PLAYBACK_STATE_PAUSE;
+        const playbackState: avSession.AVPlaybackState = {
+          state: state,
+          position: {
+            elapsedTime: Math.max(0, Math.round(this.currentPositionMs)),
+            updateTime: new Date().getTime()
+          },
+          duration: this.currentMetadata?.duration || 0
+        };
+        await this.session.setAVPlaybackState(playbackState);
+      } catch (err) {
+        hilog.error(DOMAIN, TAG, 'replay setAVPlaybackState failed: %{public}s', JSON.stringify(err));
+      }
+    } catch (err) {
+      hilog.error(DOMAIN, TAG, 'rebuild AVSession failed: %{public}s', JSON.stringify(err));
+    } finally {
+      this.rebuildingSession = false;
     }
   }
 
@@ -673,7 +758,12 @@ class HarmonyAVSessionManager {
           clearTimeout(this.stopTaskTimer);
           this.stopTaskTimer = -1;
         }
+        const wasPlaying = this.isPlaying;
         await this.startContinuousTask();
+        if (!wasPlaying) {
+          // 暂停/挂起后恢复播放：重新激活会话，防止播控中心控件消失/失灵
+          await this.reactivateSession();
+        }
       } else if (stateStr === 'stopped' || stateStr === 'idle' || stateStr === 'paused') {
         state = (stateStr === 'stopped' || stateStr === 'idle')
           ? avSession.PlaybackState.PLAYBACK_STATE_STOP
@@ -724,7 +814,14 @@ class HarmonyAVSessionManager {
         this.syncCard();
       }
     } catch (err) {
-      hilog.error(DOMAIN, TAG, 'setAVPlaybackState failed: %{public}s', JSON.stringify(err));
+      const be = err as BusinessError;
+      if (be.code === 6600102) {
+        // 会话已被系统销毁：重建，下一个 ~1s 的进度上报会补回最新播放态
+        hilog.warn(DOMAIN, TAG, 'setAVPlaybackState hit 6600102 (session gone), rebuilding');
+        await this.rebuildSession();
+      } else {
+        hilog.error(DOMAIN, TAG, 'setAVPlaybackState failed: %{public}s', JSON.stringify(err));
+      }
     }
   }
 
